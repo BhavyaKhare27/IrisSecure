@@ -1,0 +1,69 @@
+# ============================================
+# Iris Recognition System - .gitignore
+# ============================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- Virtual Environment ---
+.venv/
+venv/
+env/
+ENV/
+.env
+node_modules/
+.next/
+web/AGENTS.md
+*.tsbuildinfo
+*.sqlite
+*.sqlite3
+database/irissecure.db
+
+# --- Dataset (too large for GitHub) ---
+data/CASIA-Iris-Thousand/
+data/processed/
+iris_thousands.csv
+
+# --- Model Checkpoints (300MB+ each) ---
+models/checkpoints/
+*.pth
+*.pt
+*.onnx
+
+# --- Embedding Database (50MB+) ---
+database/embeddings.pkl
+database/gallery.pkl
+database/registration_log.json
+
+# --- Logs & Outputs ---
+logs/
+outputs/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS Files ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb
+
+# --- Misc ---
+show_stats.py
+flagged/
+models.zip
+*.zip
