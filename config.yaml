@@ -1,0 +1,59 @@
+
+# Iris Recognition System - Configuration
+
+# Dataset Configuration
+dataset:
+  root_dir: "data/CASIA-Iris-Thousand"
+  processed_dir: "data/processed"
+  csv_path: "data/processed/iris_dataset.csv"
+  image_extensions: [".jpg", ".jpeg", ".png", ".bmp"]
+
+# Preprocessing Configuration
+preprocessing:
+  image_size: [224, 224]        # Resize target (H, W) for CNN input
+  grayscale: true               # CASIA images are already grayscale
+  normalize_mean: [0.485]       # ImageNet grayscale approximation
+  normalize_std: [0.229]        # ImageNet grayscale approximation
+  apply_clahe: true             # Contrast Limited Adaptive Histogram Equalization
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: [8, 8]
+  gaussian_blur_kernel: 3       # Slight blur for noise reduction
+  
+# Data Split Configuration
+split:
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_seed: 42
+  stratify: true                # Ensure balanced split across classes
+
+# Model Configuration
+model:
+  backbone: "resnet50"          # Options: resnet18, resnet50, mobilenet_v2
+  embedding_dim: 512            # Dimension of iris embedding vector
+  pretrained: true
+  freeze_backbone: true         # Phase 1: freeze backbone, train head only
+
+# Training Configuration
+training:
+  batch_size: 32
+  num_workers: 0                 # Set to 0 on Windows to avoid shared memory errors
+  learning_rate: 0.001
+  epochs: 30                    # ArcFace typically converges in 20-30 epochs
+  optimizer: "adam"
+  scheduler: "cosine"
+  
+# Verification Configuration (for future steps)
+verification:
+  similarity_metric: "cosine"   # Options: cosine, euclidean
+  threshold: 0.75               # Acceptance threshold
+  
+# Database Configuration (for future steps)
+database:
+  storage_format: "pickle"      # Options: pickle, json
+  db_path: "database/embeddings.pkl"
+
+# Logging
+logging:
+  level: "INFO"
+  log_dir: "logs"
