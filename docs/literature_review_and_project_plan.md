@@ -2,7 +2,7 @@
 
 **Review window:** 6 November 2021–6 November 2026
 **Prepared for:** 5th Semester Development / R&D Project
-**Project stack:** Python, FastAPI, Next.js/React with TypeScript, Apache ECharts, SQLite/SQLAlchemy, statistics and optimization
+**Project stack:** Python, FastAPI, React/Next.js with JavaScript, Apache ECharts, SQLite/SQLAlchemy, statistics and optimization
 
 ## 1. Executive summary
 
@@ -12,7 +12,7 @@ IrisSecure should therefore make a narrow, testable contribution: **select a ver
 
 The app now saves pair-score distributions during empirical evaluation. The API uses those measured scores when available; otherwise it marks the threshold as a Gaussian estimate from aggregate reference statistics. It supports both EER and target-FAR objectives. This distinction matters: a threshold estimated from a few means and standard deviations is not a measured biometric result.
 
-The current project does **not** implement iris segmentation, PAD/liveness, confidence intervals, or a cancelable template scheme. Those are valid future directions, but this repository does not include their required masks, spoof labels, or protection evaluation protocol. They must not be presented as completed features.
+The current project does **not** implement iris segmentation, PAD/liveness, or a cancelable template scheme. Its evaluator now reports person-cluster bootstrap intervals for test FAR/FRR/TAR; zero observed false accepts still produce a degenerate bootstrap interval and must not be described as zero population risk. These unimplemented features require segmentation masks, spoof labels, or a template-protection evaluation protocol and must not be presented as completed features.
 
 ## 2. Review method
 
@@ -26,6 +26,7 @@ The attached brief's six references were checked against publisher, conference, 
 | **Lee et al., 2022 — Alignment-robust cancelable iris verification (R-HoG)** ([IEEE DOI](https://doi.org/10.1109/TIFS.2022.3208812)) | Applies random augmentation and gradient-orientation grouping to transform IrisCode into an alignment-robust cancelable template; evaluates CASIA-IrisV3-Internal and CASIA-IrisV4-Thousand, including unlinkability/security properties. | Establishes that template transformation, revocability, and unlinkability are explicit evaluation goals. | R-HoG protects binary IrisCode. It cannot be assumed to protect IrisSecure's 512-float neural embedding without a new design and evaluation. |
 | **Boyd et al., 2022 — State of the Art in Open-Set Iris PAD** ([arXiv](https://arxiv.org/abs/2208.10564)) | Builds a large PAD benchmark from 26 existing sources plus new data, totaling 450,000 images and seven attack types. Uses leave-one-attack-type-out evaluation and reports severe generalization failures for some algorithms that perform well in closed-set tests. | Makes unseen-attack evaluation central to PAD claims. | A bona fide CASIA recognition dataset cannot train or validate this capability; PAD requires labelled bona fide and attack samples with an explicit unseen-attack protocol. |
 | **Nguyen, Proença & Alonso-Fernandez, 2024 — Deep Learning for Iris Recognition: A Survey** ([ACM DOI](https://doi.org/10.1145/3651306)) | Reviews more than 200 works across segmentation, recognition, PAD, forensics, tools, and open challenges. | Useful map of the pipeline and research trends; emphasizes that the recognition system is more than a CNN classifier. | It is a survey, not a new benchmark result. The 99.58% Iris-SAM number should not be generalized to recognition accuracy. |
+| **Li et al., 2024 — Complex-Valued Gabor-Attention Residual Fusion Network** ([ECAI 2024 DOI](https://doi.org/10.3233/FAIA240487)) | Evaluates CASIA-Iris-Thousand and CASIA-Iris-Lamp with disjoint identities and reports EER, FRR at FAR=0.1%, and AUC. For CASIA-Iris-Thousand, the reported GRFN result is 0.68% EER, 2.59% FRR at 0.1% FAR, and 0.9997 AUC. | A same-dataset research reference stressing identity-disjoint evaluation and verification metrics. | IrisSecure now has a subject-disjoint result, but exact comparison still requires alignment of split construction, preprocessing, pair protocol, and threshold policy. The figures are not a direct leaderboard comparison. |
 | **Farmanifard & Ross, 2024 — Iris-SAM** ([arXiv preprint](https://arxiv.org/abs/2402.06497)) | Fine-tunes Segment Anything for pixel-level iris segmentation with loss functions including focal loss. Reports average segmentation accuracy of 99.58% on ND-IRIS-0405 versus 89.75% for the cited best baseline. | Supports the value of explicit segmentation and attention to class imbalance. | Pixel-level segmentation accuracy is a different task and metric from identity verification. The foundation model is heavier and needs segmentation masks for training. |
 | **Mitcheff et al., 2024 — Privacy-Safe Iris PAD** ([IEEE DOI](https://doi.org/10.1109/IJCB62174.2024.10744455), [arXiv](https://arxiv.org/abs/2408.02750)) | Trains PAD using synthetic, identity-leakage-screened bona fide iris images and synthetic textured-contact-lens attacks; reports a performance gap compared with models trained on real iris captures. | Offers a direction for reducing exposure of identity-bearing training images while studying PAD. | Synthetic training is not automatically equivalent to real capture conditions. The authors still evaluate on established PAD benchmarks. |
 | **Tinsley et al., 2023 — LivDet-Iris 2023** ([IJCB DOI](https://doi.org/10.1109/IJCB57857.2023.10448637), [arXiv](https://arxiv.org/abs/2310.04541)) | Competition report includes seven PAI categories, including GAN-generated images, and eight submitted algorithms. Best weighted ACER was 37.31%; the unweighted winner reported 22.15%. | Demonstrates that conclusions depend on attack weighting and that digital/synthetic attacks belong in evaluation. | The brief cites only 37.31% and calls it the best error without the weighting context or the alternate winner. Avoid presenting one number as a universal PAD error rate. |
@@ -70,28 +71,46 @@ A threshold selected from held-out genuine/impostor scores will provide a more e
 - Threshold chosen and whether the requested FAR was met
 - Optional API/job latency as an engineering measure (not a biometric accuracy metric)
 
-### Existing implementation in this repository
+### Implemented research improvement and current results
 
-- `evaluate.py` computes held-out genuine/impostor scores and now saves them as `outputs/evaluation/score_distributions.npz`.
-- `api/analytics.py` uses these empirical score distributions when present and marks the source as empirical. Before evaluation data exist, it uses aggregate Gaussian statistics and marks that output as an estimate.
-- FastAPI background tasks run threshold optimization locally. The API accepts EER balancing or a target-FAR constraint; the Next.js dashboard exposes those operating modes and charts FAR/FRR.
-- SQLAlchemy stores the gallery; the dashboard handles enrollment and identification/verification when a trained checkpoint is installed.
+- A reproducible **subject-disjoint split has been prepared** from the local CASIA-Iris-Thousand dataset: 700 people / 14,000 images / 1,400 person-eye classes for training; 150 / 3,000 / 300 for validation; and 150 / 3,000 / 300 for test. Both eyes and every image belonging to a person remain in the same subset. The split uses seed 42 and is stored locally under `data/splits/subject_disjoint/`.
+- `train.py` now reads the subject-disjoint manifests, trains ArcFace classes only for the 1,400 training person-eye classes, evaluates validation verification scores on unseen identities, and selects the checkpoint by validation EER. It writes to a unique run directory so the existing deployed checkpoint is preserved.
+- `evaluate.py` requires checkpoint metadata matching those manifests. It selected EER and target-FAR thresholds on validation, froze them, and reported held-out test results against fixed 0.75. It also computed subject-cluster bootstrap intervals and recorded dataset/manifest/checkpoint provenance.
+- **Subject-disjoint evaluation completed:** best checkpoint is epoch 26 with validation EER 0.7673%. The EER threshold selected on validation was 0.373255. On test (150 people; 3,000 genuine and 50,000 sampled impostor pairs), FAR was 0.906%, FRR 0.867%, TAR 99.133%, and ROC-AUC 0.999346.
+- At fixed threshold 0.75, test FAR was 0.006% (3/50,000), FRR 26.667%, and TAR 73.333%. The EER-selected operating point gains 25.80 percentage points of TAR while increasing observed FAR by 0.900 percentage points; this is an operating-point trade-off, not an unqualified improvement.
+- Validation-selected target-FAR points also show test transfer: target 1% yielded test FAR 1.162%, FRR 0.767%, TAR 99.233%; target 0.1% yielded 0.138%, 3.800%, 96.200%; target 0.01% yielded 0.028%, 11.700%, 88.300%, respectively. Test rates can differ from validation targets.
+- The 500-repetition subject-cluster bootstrap 95% intervals at the EER threshold were FAR 0.691%–1.174%, FRR 0.400%–1.433%, and TAR 98.567%–99.600%; at fixed 0.75 they were FAR 0%–0.0161%, FRR 22.467%–30.967%, and TAR 69.033%–77.533%. These intervals reflect 150 people and the sampled pairs, not all deployment populations.
+- `api/analytics.py` trusts empirical calibration only when the report fingerprint matches the active checkpoint. Otherwise it labels the Gaussian aggregate-statistics fallback as an estimate. FastAPI background tasks and the React dashboard support EER balancing and target-FAR exploration locally.
+- The dashboard and API provide enrollment and identification/verification workflows. A working local demo is a functional result, distinct from the measured subject-disjoint biometric evaluation.
 
-### Experimental protocol to complete
+### Protocol status and next experiment
 
-1. Record exact dataset release, file count, sensor/modality, excluded files, code commit, model checkpoint hash, and seed.
-2. Keep a reproducible subject-eye stratified train/validation/test split for closed-set recognition, but group repeated acquisitions/sessions when metadata allows. Report clearly that train/test share identity classes; do not call it identity-disjoint generalization.
-3. Fit/select operating thresholds using the validation split. Report final metrics once on the untouched test split. Do not tune on test scores and then report the same test as an unbiased result.
-4. Compare the three threshold policies above, with pair counts and the exact target FAR. At very small FAR, the impostor sample count limits what can be claimed; for example, 0 observed false accepts among a finite sample does not prove a zero population FAR.
-5. Add subject-cluster confidence intervals before making population-level uncertainty claims. Pair scores reuse images and are correlated; a naive bootstrap over pairs would overstate the effective sample size.
-6. Run liveness/PAD as a separate extension only after obtaining an appropriate LivDet or comparable labelled PAD dataset and using cross-attack evaluation. Do not train a “liveness” classifier on ordinary CASIA identity images.
-7. Evaluate a protected/cancelable template as a separate security workstream against irreversibility, unlinkability, revocability, and matching performance. Do not relabel ordinary JSON/SQL embedding storage as privacy-preserving.
+1. Record dataset release, file count, sensor/modality, exclusions, code revision, checkpoint hash, and seed for the final experiment.
+2. **Prepared:** use the reproducible person-disjoint manifests and verify no subject overlap. The split groups each person and both eyes together; repeated acquisition/session metadata are not available to define a stronger session-disjoint protocol.
+3. **Completed:** train on the 700-person training set; best checkpoint was selected at epoch 26 using validation EER.
+4. **Completed:** freeze validation-selected EER and target-FAR thresholds, then report the untouched 150-person test set against fixed 0.75. Pair scores reuse people/images, so 50,000 comparisons do not mean 50,000 independent identities.
+5. **Completed:** compute 500 person-cluster bootstrap repetitions. Interpret intervals within this sample; do not treat observed FAR or an interval endpoint as a guarantee for other populations.
+6. Compare with published results only after aligning dataset version, split protocol, task, and metric. The earlier image-level checkpoint and its generated artifacts are excluded from the cleaned project workspace.
+7. Run liveness/PAD as a separate extension only after obtaining an appropriate LivDet or comparable labelled PAD dataset and using cross-attack evaluation. Do not train a “liveness” classifier on ordinary CASIA identity images.
+8. Evaluate a protected/cancelable template as a separate security workstream against irreversibility, unlinkability, revocability, and matching performance. Do not relabel ordinary JSON/SQL embedding storage as privacy-preserving.
+
+### Final subject-disjoint result summary
+
+| Measure | Subject-disjoint result |
+|---|---|
+| Selected checkpoint / epoch / checkpoint SHA-256 | Epoch 26; `a90916232faa7a727871fb0467a5bfb2bed65376c5dcfcbf2a294d89d743e5ee` |
+| Validation EER and selected threshold | 0.7673%; 0.373255 |
+| Test ROC-AUC | 0.999346 |
+| Test FAR / FRR / TAR at frozen validation-EER threshold | 0.906% / 0.867% / 99.133% |
+| Test FAR / FRR / TAR at fixed threshold 0.75 | 0.006% / 26.667% / 73.333% |
+| Test results at validation-selected target-FAR thresholds | Target 1%: FAR 1.162%, FRR 0.767%; target 0.1%: 0.138%, 3.800%; target 0.01%: 0.028%, 11.700% |
+| Genuine/impostor pair counts and person-cluster 95% intervals | 3,000 / 50,000; 500 resamples over 150 people; see report above |
 
 ## 6. What the current project can and cannot claim
 
-**Can claim:** a working research prototype with a learned iris embedding model, API/web interface, gallery storage, empirical score-based threshold selection after running evaluation, and a clearly labelled aggregate-statistic fallback.
+**Can claim now:** a working local research prototype; a completed subject-disjoint train/validation/test experiment with validation-selected thresholding, held-out test metrics, pair counts, and subject-cluster bootstrap intervals; and a local API/dashboard demo using the selected subject-disjoint checkpoint. Old checkpoint and identity-overlapping evaluation artifacts have been removed from the workspace.
 
-**Cannot yet claim:** state-of-the-art accuracy, deployment-grade biometric security, liveness/PAD, iris segmentation, statistically independent confidence intervals, cancelable templates, or compliance with ISO/IEC 24745. The repository currently lacks a checkpoint, the CASIA dataset, LivDet labels, segmentation masks, and generated empirical test scores.
+**Cannot claim:** state-of-the-art performance or direct comparability with published results without aligned protocols, zero population FAR, deployment-grade biometric security, liveness/PAD, iris segmentation, cancelable templates, or compliance with ISO/IEC 24745. The app has no user authentication and does not encrypt stored embeddings at rest; it is intended for a local classroom/research demo and should not be exposed publicly. The Git repository excludes local datasets, checkpoints, and generated evaluation outputs.
 
 ## 7. References
 
@@ -107,3 +126,5 @@ A threshold selected from held-out genuine/impostor scores will provide a more e
 10. B. Dowling et al., “VISER: Visually-Informed System for Enhanced Robustness in Open-Set Iris Presentation Attack Detection,” 2026 preprint. [arXiv:2603.17859](https://arxiv.org/abs/2603.17859)
 11. “Diff-IrisPAD: Modeling Bona Fide Iris Distributions for Unsupervised Presentation Attack Detection,” 2026 preprint. [arXiv:2610.29611](https://arxiv.org/abs/2610.29611)
 12. ISO/IEC 24745:2022, *Biometric information protection*. [ISO catalogue entry](https://www.iso.org/standard/75302.html)
+13. Z. Li et al., “Complex-Valued Gabor-Attention Residual Fusion Network for Iris Recognition,” ECAI 2024. [doi:10.3233/FAIA240487](https://doi.org/10.3233/FAIA240487)
+14. ISO/IEC 19795-1:2021, *Biometric performance testing and reporting — Part 1: Principles and framework*. [ISO catalogue entry](https://www.iso.org/standard/73515.html)

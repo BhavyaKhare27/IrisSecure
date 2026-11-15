@@ -140,6 +140,93 @@ def generate_evaluation_pairs(embeddings: np.ndarray,
     return genuine_scores, impostor_scores
 
 
+def generate_verification_scores(embeddings: np.ndarray,
+                                 labels: np.ndarray,
+                                 max_genuine_per_class: int = 10,
+                                 max_impostor_pairs: int = 50000,
+                                 seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """Create reproducible genuine and unique impostor cosine scores.
+
+    Labels represent person-eye classes. Different eyes from the same person
+    are distinct classes, matching the enrollment protocol used by IrisSecure.
+    """
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    labels = np.asarray(labels)
+    if embeddings.ndim != 2 or labels.ndim != 1 or len(embeddings) != len(labels):
+        raise ValueError("Expected a 2D embedding matrix and one label per embedding")
+    if len(embeddings) < 2 or len(np.unique(labels)) < 2:
+        raise ValueError("Verification requires at least two images from two classes")
+    if max_genuine_per_class < 1 or max_impostor_pairs < 1:
+        raise ValueError("Pair limits must be positive")
+
+    rng = np.random.default_rng(seed)
+    class_indices = [np.flatnonzero(labels == label) for label in np.unique(labels)]
+    genuine_scores = []
+    within_class_pairs = 0
+    for indices in class_indices:
+        within_class_pairs += len(indices) * (len(indices) - 1) // 2
+        pairs = np.array(list(combinations(indices.tolist(), 2)), dtype=np.int64)
+        if len(pairs) > max_genuine_per_class:
+            pairs = pairs[rng.choice(len(pairs), max_genuine_per_class, replace=False)]
+        if len(pairs):
+            genuine_scores.extend(np.einsum(
+                'ij,ij->i', embeddings[pairs[:, 0]], embeddings[pairs[:, 1]]
+            ).tolist())
+
+    n = len(embeddings)
+    target = min(max_impostor_pairs, n * (n - 1) // 2 - within_class_pairs)
+    if target < 1 or not genuine_scores:
+        raise ValueError("Validation data must contain genuine and impostor pairs")
+
+    chosen = set()
+    while len(chosen) < target:
+        need = target - len(chosen)
+        batch = max(4096, need * 2)
+        left = rng.integers(0, n, size=batch)
+        right = rng.integers(0, n, size=batch)
+        keep = (left != right) & (labels[left] != labels[right])
+        kept_left, kept_right = left[keep], right[keep]
+        pair_left = np.minimum(kept_left, kept_right)
+        pair_right = np.maximum(kept_left, kept_right)
+        keys = np.unique(pair_left.astype(np.int64) * n + pair_right.astype(np.int64))
+        for key in keys:
+            chosen.add(int(key))
+            if len(chosen) == target:
+                break
+
+    pair_keys = np.fromiter(chosen, dtype=np.int64, count=target)
+    left, right = pair_keys // n, pair_keys % n
+    impostor_scores = np.einsum(
+        'ij,ij->i', embeddings[left], embeddings[right]
+    ).astype(np.float64)
+    return np.asarray(genuine_scores, dtype=np.float64), impostor_scores
+
+
+def select_eer_threshold(genuine_scores: np.ndarray,
+                          impostor_scores: np.ndarray) -> dict:
+    """Select the empirical threshold minimizing the FAR/FRR gap."""
+    genuine = np.asarray(genuine_scores, dtype=np.float64)
+    impostor = np.asarray(impostor_scores, dtype=np.float64)
+    if genuine.size == 0 or impostor.size == 0:
+        raise ValueError("EER requires non-empty genuine and impostor score arrays")
+
+    thresholds = np.unique(np.concatenate([genuine, impostor]))
+    thresholds = np.concatenate([thresholds, [np.nextafter(thresholds[-1], np.inf)]])
+    genuine_sorted = np.sort(genuine)
+    impostor_sorted = np.sort(impostor)
+    frr = np.searchsorted(genuine_sorted, thresholds, side='left') / genuine.size
+    far = (impostor.size - np.searchsorted(impostor_sorted, thresholds, side='left')) / impostor.size
+    index = int(np.argmin(np.abs(far - frr)))
+    return {
+        'eer': float((far[index] + frr[index]) / 2.0),
+        'threshold': float(thresholds[index]),
+        'far': float(far[index]),
+        'frr': float(frr[index]),
+        'num_genuine_pairs': int(genuine.size),
+        'num_impostor_pairs': int(impostor.size),
+    }
+
+
 # ============================================
 # Biometric Metrics
 # ============================================

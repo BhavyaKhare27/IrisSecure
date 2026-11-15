@@ -21,6 +21,8 @@ import sys
 import json
 import argparse
 import logging
+import hashlib
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
@@ -32,19 +34,23 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.ticker import LogLocator, LogFormatter
 import seaborn as sns
+from sklearn.metrics import roc_auc_score
+import torch
+from torch.utils.data import DataLoader
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.similarity import (
-    generate_evaluation_pairs,
     compute_far_frr,
     compute_eer,
     compute_roc,
     compute_tar_at_far,
     find_optimal_threshold,
 )
+from utils.preprocessing import IrisDataset, get_val_transforms
+from generate_embeddings import load_trained_model, extract_embeddings
 
 # Configure logging
 logging.basicConfig(
@@ -275,212 +281,423 @@ def plot_combined_dashboard(genuine_scores, impostor_scores,
 # Main Evaluation Pipeline
 # ============================================
 
+def generate_protocol_scores(embeddings, labels, subject_ids, max_genuine_per_class=10,
+                             max_impostor_pairs=50000, seed=42):
+    """Create reproducible, unique image-pair scores with subject-cluster metadata."""
+    from itertools import combinations
+
+    rng = np.random.default_rng(seed)
+    class_indices = {label: np.flatnonzero(labels == label) for label in np.unique(labels)}
+    class_subject = {}
+    genuine, genuine_subject = [], []
+    for label, indices in class_indices.items():
+        # A person-eye class must refer to exactly one person.
+        people = np.unique(subject_ids[indices])
+        if len(people) != 1:
+            raise ValueError(f"Class {label} maps to multiple people: {people.tolist()}")
+        class_subject[label] = people[0]
+        pairs = list(combinations(indices.tolist(), 2))
+        if len(pairs) > max_genuine_per_class:
+            pairs = [pairs[i] for i in rng.choice(len(pairs), max_genuine_per_class, replace=False)]
+        for left, right in pairs:
+            genuine.append(float(np.dot(embeddings[left], embeddings[right])))
+            genuine_subject.append(people[0])
+
+    # Sample distinct unordered image pairs, rather than sampling with replacement.
+    n = len(embeddings)
+    if n < 2 or len(class_indices) < 2:
+        raise ValueError("At least two images from two person-eye classes are required")
+    within_class_pairs = sum(len(indices) * (len(indices) - 1) // 2
+                             for indices in class_indices.values())
+    target = min(max_impostor_pairs, n * (n - 1) // 2 - within_class_pairs)
+    chosen = set()
+    while len(chosen) < target:
+        need = target - len(chosen)
+        batch = max(4096, need * 2)
+        left = rng.integers(0, n, size=batch)
+        right = rng.integers(0, n, size=batch)
+        keep = (left != right) & (labels[left] != labels[right])
+        left, right = np.minimum(left[keep], right[keep]), np.maximum(left[keep], right[keep])
+        keys = np.unique(left.astype(np.int64) * n + right.astype(np.int64))
+        for key in keys:
+            chosen.add(int(key))
+            if len(chosen) == target:
+                break
+    pair_keys = np.fromiter(chosen, dtype=np.int64, count=target)
+    imp_left, imp_right = pair_keys // n, pair_keys % n
+    impostor = np.einsum('ij,ij->i', embeddings[imp_left], embeddings[imp_right]).astype(np.float64)
+    impostor_subjects = np.column_stack([subject_ids[imp_left], subject_ids[imp_right]])
+    return (np.asarray(genuine, dtype=np.float64), impostor,
+            np.asarray(genuine_subject), impostor_subjects)
+
+
+def exact_curve(genuine, impostor):
+    """Calculate empirical FAR/FRR at every observed score threshold."""
+    thresholds = np.unique(np.concatenate([genuine, impostor]))
+    thresholds = np.concatenate([thresholds, [np.nextafter(thresholds[-1], np.inf)]])
+    gs, ins = np.sort(genuine), np.sort(impostor)
+    frr = np.searchsorted(gs, thresholds, side='left') / max(1, len(gs))
+    far = (len(ins) - np.searchsorted(ins, thresholds, side='left')) / max(1, len(ins))
+    return thresholds, far, frr
+
+
+def metrics_at_threshold(genuine, impostor, threshold):
+    far = float(np.mean(impostor >= threshold))
+    frr = float(np.mean(genuine < threshold))
+    return {"threshold": float(threshold), "far": far, "frr": frr,
+            "tar": 1.0 - frr, "balanced_accuracy": 1.0 - (far + frr) / 2.0,
+            "num_genuine_pairs": int(len(genuine)), "num_impostor_pairs": int(len(impostor))}
+
+
+def select_eer_threshold(genuine, impostor):
+    thresholds, far, frr = exact_curve(genuine, impostor)
+    index = int(np.argmin(np.abs(far - frr)))
+    return float(thresholds[index]), float((far[index] + frr[index]) / 2.0), thresholds, far, frr
+
+
+def select_target_far_threshold(genuine, impostor, target_far):
+    thresholds, far, frr = exact_curve(genuine, impostor)
+    acceptable = np.flatnonzero(far <= target_far)
+    index = int(acceptable[0]) if acceptable.size else len(thresholds) - 1
+    return float(thresholds[index]), float(far[index]), float(frr[index])
+
+
+def subject_cluster_bootstrap(genuine, impostor, genuine_subjects, impostor_subjects,
+                              thresholds, repetitions=500, seed=2026):
+    """Percentile intervals from resampling people, keeping each person's eye classes together."""
+    people = np.unique(np.concatenate([genuine_subjects, impostor_subjects.ravel()]))
+    person_index = {person: index for index, person in enumerate(people)}
+    gs = np.asarray([person_index[p] for p in genuine_subjects], dtype=np.int32)
+    ia = np.asarray([person_index[p] for p in impostor_subjects[:, 0]], dtype=np.int32)
+    ib = np.asarray([person_index[p] for p in impostor_subjects[:, 1]], dtype=np.int32)
+    rng = np.random.default_rng(seed)
+    collected = {name: {metric: [] for metric in ('far', 'frr', 'tar')}
+                 for name in thresholds}
+    for _ in range(repetitions):
+        multiplicity = np.bincount(rng.integers(0, len(people), size=len(people)), minlength=len(people))
+        gw = multiplicity[gs].astype(np.float64)
+        iw = (multiplicity[ia] * multiplicity[ib]).astype(np.float64)
+        same_person = ia == ib
+        iw[same_person] = multiplicity[ia[same_person]]
+        gden, iden = gw.sum(), iw.sum()
+        if not gden or not iden:
+            continue
+        for name, threshold in thresholds.items():
+            frr = float(gw[genuine < threshold].sum() / gden)
+            far = float(iw[impostor >= threshold].sum() / iden)
+            collected[name]['far'].append(far)
+            collected[name]['frr'].append(frr)
+            collected[name]['tar'].append(1.0 - frr)
+    intervals = {}
+    for name, values in collected.items():
+        intervals[name] = {
+            metric: [float(np.percentile(samples, 2.5)), float(np.percentile(samples, 97.5))]
+            for metric, samples in values.items() if samples
+        }
+    zero_event_thresholds = [name for name, threshold in thresholds.items()
+                              if not np.any(impostor >= threshold)]
+    return {"method": "subject-cluster bootstrap percentile interval",
+            "repetitions": repetitions, "people": int(len(people)), "confidence": 0.95,
+            "conditional_on_frozen_validation_thresholds": True, "intervals": intervals,
+            "limitations": ("The percentile bootstrap is degenerate for FAR when no impostor was accepted; "
+                            "a [0, 0] interval is not evidence that population FAR is zero. "
+                            "Use the observed pair count and a larger, more diverse impostor test."),
+            "zero_observed_false_accept_thresholds": zero_event_thresholds}
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Iris Recognition System")
-    parser.add_argument('--max_impostor', type=int, default=50000,
-                        help='Max impostor pairs to generate')
-    parser.add_argument('--max_genuine_per_class', type=int, default=10,
-                        help='Max genuine pairs per class')
+    parser = argparse.ArgumentParser(description="Evaluate IrisSecure on unseen identities")
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Checkpoint to evaluate (default: configured run best model)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size for validation/test embedding extraction')
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='DataLoader workers for local evaluation')
+    parser.add_argument('--max_impostor', type=int, default=None,
+                        help='Maximum unique impostor pairs per split')
+    parser.add_argument('--max_genuine_per_class', type=int, default=None,
+                        help='Maximum genuine pairs per person-eye class')
     parser.add_argument('--output_dir', type=str, default='outputs/evaluation',
-                        help='Output directory for plots and reports')
-    parser.add_argument('--split', type=str, default='test',
-                        choices=['test', 'val', 'all'],
-                        help='Which data split to evaluate on')
+                        help='Output root; results are placed in a run-specific subdirectory')
+    parser.add_argument('--bootstrap_repetitions', type=int, default=500,
+                        help='Subject-cluster bootstrap repetitions for test-rate intervals')
     args = parser.parse_args()
-    
-    # Setup
-    import pickle
+    if args.batch_size < 1 or args.bootstrap_repetitions < 1:
+        parser.error('batch_size and bootstrap_repetitions must be positive')
+
     import yaml
-    
-    output_dir = PROJECT_ROOT / args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    print("\n" + "=" * 65)
-    print("   Iris Recognition System — Biometric Evaluation")
-    print("=" * 65 + "\n")
-    
-    # Load config
-    with open(PROJECT_ROOT / "config.yaml", 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Load embeddings
-    print("   Loading embeddings...")
-    db_path = PROJECT_ROOT / "database" / "embeddings.pkl"
-    if not db_path.exists():
-        logger.error("Embeddings not found. Run generate_embeddings.py first!")
-        sys.exit(1)
-    
-    with open(db_path, 'rb') as f:
-        embedding_records = pickle.load(f)
-    
-    # Load appropriate split
-    processed_dir = PROJECT_ROOT / config['dataset']['processed_dir']
-    
-    if args.split == 'all':
-        split_df = pd.read_csv(processed_dir / "iris_dataset.csv")
+
+    with (PROJECT_ROOT / 'config.yaml').open(encoding='utf-8') as source:
+        config = yaml.safe_load(source)
+    run_name = os.getenv(
+        'IRISSECURE_RUN_NAME', config['training'].get('run_name', 'subject_disjoint_run')
+    )
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else (
+        PROJECT_ROOT / config['training'].get('output_root', 'models/runs') /
+        run_name / 'checkpoints' / 'best_model.pth'
+    )
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = PROJECT_ROOT / checkpoint_path
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Subject-disjoint checkpoint not found: {checkpoint_path}. "
+            "Complete the final training run first, or pass --checkpoint explicitly."
+        )
+
+    split_dir = PROJECT_ROOT / config['dataset'].get(
+        'subject_split_dir', 'data/splits/subject_disjoint'
+    )
+    split_metadata_path = split_dir / 'split_metadata.json'
+    if not split_metadata_path.is_file():
+        raise FileNotFoundError(f"Subject-disjoint split metadata not found: {split_metadata_path}")
+    split_metadata = json.loads(split_metadata_path.read_text(encoding='utf-8'))
+    frames = {
+        name: pd.read_csv(split_dir / f'{name}.csv', dtype={'person_id': str})
+        for name in ('train', 'val', 'test')
+    }
+    for name, frame in frames.items():
+        missing = {'person_id', 'label', 'label_idx', 'image_path'} - set(frame.columns)
+        if missing:
+            raise ValueError(f"{name} manifest is missing columns: {sorted(missing)}")
+        actual_people = set(frame['person_id'].astype(str))
+        metadata_people = set(map(str, split_metadata.get('subjects', {}).get(name, [])))
+        if actual_people != metadata_people:
+            raise ValueError(f"{name} manifest identities do not match split_metadata.json")
+
+    subject_sets = {name: set(frame['person_id'].astype(str)) for name, frame in frames.items()}
+    for left, right in (('train', 'val'), ('train', 'test'), ('val', 'test')):
+        overlap = subject_sets[left] & subject_sets[right]
+        if overlap:
+            raise ValueError(f"Identity leakage between {left} and {right}: {len(overlap)} people")
+
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = torch.device('mps')
     else:
-        split_df = pd.read_csv(processed_dir / f"{args.split}.csv")
-    
-    split_paths = set(split_df['image_path'].tolist())
-    
-    # Filter embeddings to the selected split
-    embeddings_list = []
-    labels_list = []
-    
-    for rec in embedding_records:
-        if rec['image_path'] in split_paths:
-            embeddings_list.append(rec['embedding'])
-            labels_list.append(rec['label_idx'])
-    
-    embeddings = np.array(embeddings_list)
-    labels = np.array(labels_list)
-    
-    n_classes = len(np.unique(labels))
-    print(f"   Split: {args.split}")
-    print(f"   Embeddings: {len(embeddings):,}")
-    print(f"   Classes: {n_classes}")
-    
-    # Generate evaluation pairs
-    print(f"\n   Generating evaluation pairs...")
-    genuine_scores, impostor_scores = generate_evaluation_pairs(
-        embeddings, labels,
-        max_genuine_per_class=args.max_genuine_per_class,
-        max_impostor_pairs=args.max_impostor,
-        seed=42
-    )
-    
-    print(f"   Genuine pairs:  {len(genuine_scores):,}")
-    print(f"   Impostor pairs: {len(impostor_scores):,}")
-    
-    # Compute metrics
-    print("\n   Computing biometric metrics...")
-    
-    # EER
-    eer, eer_threshold = compute_eer(genuine_scores, impostor_scores)
-    
-    # ROC
-    fpr, tpr, auc = compute_roc(genuine_scores, impostor_scores)
-    
-    # FAR/FRR
-    thresholds, far, frr = compute_far_frr(genuine_scores, impostor_scores)
-    
-    # TAR@FAR
-    tar_at_far = compute_tar_at_far(genuine_scores, impostor_scores,
-                                     target_far_values=[0.1, 0.01, 0.001, 0.0001])
-    
-    # Optimal thresholds
-    _, eer_metrics = find_optimal_threshold(genuine_scores, impostor_scores, method='eer')
-    _, acc_metrics = find_optimal_threshold(genuine_scores, impostor_scores, method='max_accuracy')
-    
-    # Print report
+        device = torch.device('cpu')
+    model, checkpoint_info = load_trained_model(str(checkpoint_path), device)
+    checkpoint_split = checkpoint_info.get('split_metadata')
+    if not checkpoint_split or checkpoint_split.get('subjects') != split_metadata.get('subjects'):
+        raise ValueError(
+            "Checkpoint split metadata does not match the current subject-disjoint manifests. "
+            "Train a model using the configured split before evaluating it."
+        )
+
+    pp_cfg = config['preprocessing']
+    image_size = tuple(pp_cfg['image_size'])
+
+    def embeddings_for(frame, split_name):
+        frame = frame.copy()
+        frame['image_path'] = frame['image_path'].map(
+            lambda value: str((PROJECT_ROOT / value).resolve())
+            if not Path(value).is_absolute() else value
+        )
+        missing_paths = [path for path in frame['image_path'] if not Path(path).is_file()]
+        if missing_paths:
+            raise FileNotFoundError(
+                f"{split_name} manifest references missing image: {missing_paths[0]}"
+            )
+        dataset = IrisDataset(
+            frame,
+            transform=get_val_transforms(image_size),
+            image_size=image_size,
+            apply_clahe_flag=pp_cfg.get('apply_clahe', True),
+            clahe_clip_limit=pp_cfg.get('clahe_clip_limit', 2.0),
+            clahe_tile_grid_size=tuple(pp_cfg.get('clahe_tile_grid_size', [8, 8])),
+            gaussian_blur_kernel=pp_cfg.get('gaussian_blur_kernel', 3),
+        )
+        loader = DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=device.type == 'cuda'
+        )
+        vectors, labels = extract_embeddings(model, loader, device, use_fp16=True)
+        expected_labels = frame['label_idx'].to_numpy(dtype=np.int64)
+        if not np.array_equal(labels.astype(np.int64), expected_labels):
+            raise ValueError(f"{split_name} embedding order does not match its manifest")
+        return vectors.astype(np.float32), expected_labels, frame['person_id'].astype(str).to_numpy()
+
+    output_dir = PROJECT_ROOT / args.output_dir / run_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(output_dir, 0o700)
     print("\n" + "=" * 65)
-    print("   EVALUATION RESULTS")
+    print("   IrisSecure — Subject-Disjoint Biometric Evaluation")
     print("=" * 65)
-    print(f"   Equal Error Rate (EER):     {eer*100:.4f}%")
-    print(f"   EER Threshold:              {eer_threshold:.4f}")
-    print(f"   ROC AUC:                    {auc:.6f}")
-    print(f"   Optimal Threshold (acc):    {acc_metrics['threshold']:.4f}")
-    print("-" * 65)
-    print("   TAR @ Operating Points:")
-    for key, val in tar_at_far.items():
-        print(f"     {key}: {val*100:.2f}%")
-    print("-" * 65)
-    print(f"   Genuine:  mean={np.mean(genuine_scores):.4f}, "
-          f"std={np.std(genuine_scores):.4f}, "
-          f"min={np.min(genuine_scores):.4f}")
-    print(f"   Impostor: mean={np.mean(impostor_scores):.4f}, "
-          f"std={np.std(impostor_scores):.4f}, "
-          f"max={np.max(impostor_scores):.4f}")
-    print(f"   Separation Gap: {np.mean(genuine_scores) - np.mean(impostor_scores):.4f}")
-    print("=" * 65)
-    
-    # Generate plots
-    print("\n   Generating evaluation plots...")
-    
-    plot_score_distributions(
-        genuine_scores, impostor_scores, eer_threshold,
-        output_dir / "score_distributions.png"
+    print(f"   Checkpoint: {checkpoint_path}")
+    print(f"   Device: {device} | batch size: {args.batch_size}")
+
+    print(f"   Extracting validation embeddings ({len(frames['val']):,} images)...")
+    val_embeddings, val_labels, val_subjects = embeddings_for(frames['val'], 'validation')
+    print(f"   Extracting test embeddings ({len(frames['test']):,} images)...")
+    test_embeddings, test_labels, test_subjects = embeddings_for(frames['test'], 'test')
+
+    try:
+        git_revision = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], cwd=PROJECT_ROOT,
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
+        worktree_dirty = subprocess.run(
+            ['git', 'diff', '--quiet'], cwd=PROJECT_ROOT
+        ).returncode != 0
+    except (OSError, subprocess.CalledProcessError):
+        git_revision, worktree_dirty = None, None
+
+    validation_seed = int(config['training'].get('seed', 42))
+    verification_cfg = config.get('verification', {})
+    configured_genuine_limit = verification_cfg.get('validation_max_genuine_pairs_per_class', 10)
+    genuine_limit = int(args.max_genuine_per_class or configured_genuine_limit)
+    max_impostor_pairs = int(args.max_impostor or verification_cfg.get(
+        'validation_max_impostor_pairs', 50000
+    ))
+    if genuine_limit < 1:
+        parser.error('max_genuine_per_class must be positive')
+    if max_impostor_pairs < 1:
+        parser.error('max_impostor must be positive')
+
+    def split_scores(embeddings, labels, subjects, seed):
+        return generate_protocol_scores(
+            embeddings, labels, subjects, genuine_limit, max_impostor_pairs, seed
+        )
+
+    print('   Generating validation pairs for threshold selection...')
+    vg, vi, vgs, vis = split_scores(
+        val_embeddings, val_labels, val_subjects, seed=validation_seed
     )
-    
-    plot_roc_curve(fpr, tpr, auc, output_dir / "roc_curve.png")
-    
-    plot_far_frr(
-        thresholds, far, frr, eer, eer_threshold,
-        output_dir / "far_frr_analysis.png"
+    val_threshold, val_eer, val_thresholds, val_far_curve, val_frr_curve = select_eer_threshold(vg, vi)
+    validation_metrics = metrics_at_threshold(vg, vi, val_threshold)
+    val_auc = float(roc_auc_score(
+        np.r_[np.ones(len(vg)), np.zeros(len(vi))], np.r_[vg, vi]
+    ))
+    validation_path = output_dir / 'validation_score_distributions.npz'
+    np.savez_compressed(validation_path, genuine_scores=vg.astype(np.float32),
+                        impostor_scores=vi.astype(np.float32))
+
+    print('   Generating held-out test pairs...')
+    tg, ti, tgs, tis = split_scores(
+        test_embeddings, test_labels, test_subjects, seed=validation_seed + 1
     )
-    
-    plot_det_curve(far, frr, eer, output_dir / "det_curve.png")
-    
-    plot_combined_dashboard(
-        genuine_scores, impostor_scores,
-        thresholds, far, frr, fpr, tpr,
-        eer, eer_threshold, auc, tar_at_far,
-        output_dir / "evaluation_dashboard.png"
+    test_selected = metrics_at_threshold(tg, ti, val_threshold)
+    test_fixed = metrics_at_threshold(tg, ti, 0.75)
+    test_auc = float(roc_auc_score(
+        np.r_[np.ones(len(tg)), np.zeros(len(ti))], np.r_[tg, ti]
+    ))
+    target_operations = {}
+    for target_far in (0.01, 0.001, 0.0001):
+        threshold, achieved_val_far, achieved_val_frr = select_target_far_threshold(vg, vi, target_far)
+        target_operations[str(target_far)] = {
+            'threshold_selected_on_validation': threshold,
+            'validation_far': achieved_val_far,
+            'validation_frr': achieved_val_frr,
+            'test_metrics_at_threshold': metrics_at_threshold(tg, ti, threshold),
+            'validation_impostor_pair_resolution': 1.0 / len(vi),
+            'target_supported_by_pair_count': target_far >= 1.0 / len(vi),
+        }
+
+    bootstrap = subject_cluster_bootstrap(
+        tg, ti, tgs, tis,
+        {'validation_eer': val_threshold, 'fixed_0.75': 0.75},
+        repetitions=args.bootstrap_repetitions,
     )
-    
-    # Save metrics report
-    score_path = output_dir / "score_distributions.npz"
-    np.savez_compressed(
-        score_path,
-        genuine_scores=genuine_scores.astype(np.float32),
-        impostor_scores=impostor_scores.astype(np.float32),
-    )
+    test_path = output_dir / 'score_distributions.npz'
+    np.savez_compressed(test_path, genuine_scores=tg.astype(np.float32),
+                        impostor_scores=ti.astype(np.float32))
 
     report = {
         'evaluation_date': datetime.now().isoformat(),
-        'split': args.split,
-        'num_embeddings': len(embeddings),
-        'num_classes': n_classes,
-        'num_genuine_pairs': len(genuine_scores),
-        'num_impostor_pairs': len(impostor_scores),
-        'score_distributions_file': score_path.name,
-        'eer': round(eer, 6),
-        'eer_percent': round(eer * 100, 4),
-        'eer_threshold': round(eer_threshold, 4),
-        'roc_auc': round(auc, 6),
-        'tar_at_far': tar_at_far,
-        'optimal_threshold_eer': eer_metrics,
-        'optimal_threshold_accuracy': acc_metrics,
-        'genuine_stats': {
-            'mean': round(float(np.mean(genuine_scores)), 4),
-            'std': round(float(np.std(genuine_scores)), 4),
-            'min': round(float(np.min(genuine_scores)), 4),
-            'max': round(float(np.max(genuine_scores)), 4),
+        'split': 'test',
+        'calibration_split': 'val',
+        'threshold_selection': 'EER selected on validation; frozen for test reporting',
+        'protocol': 'person-eye verification; unique unordered image pairs; subject-cluster bootstrap',
+        'train_val_identity_overlap': False,
+        'train_test_identity_overlap': False,
+        'validation_test_identity_overlap': False,
+        'checkpoint': str(checkpoint_path),
+        'checkpoint_epoch': checkpoint_info.get('epoch'),
+        'checkpoint_validation_eer': checkpoint_info.get('val_eer'),
+        'checkpoint_validation_threshold': checkpoint_info.get('val_threshold'),
+        'training_seed': checkpoint_info.get('training_seed'),
+        'reproducibility': {
+            'checkpoint_sha256': sha256_file(checkpoint_path),
+            'train_manifest_sha256': sha256_file(split_dir / 'train.csv'),
+            'validation_manifest_sha256': sha256_file(split_dir / 'val.csv'),
+            'test_manifest_sha256': sha256_file(split_dir / 'test.csv'),
+            'split_metadata_sha256': sha256_file(split_metadata_path),
+            'git_revision': git_revision,
+            'git_worktree_dirty': worktree_dirty,
+            'validation_pair_seed': validation_seed,
+            'test_pair_seed': validation_seed + 1,
+            'bootstrap_seed': 2026,
         },
-        'impostor_stats': {
-            'mean': round(float(np.mean(impostor_scores)), 4),
-            'std': round(float(np.std(impostor_scores)), 4),
-            'min': round(float(np.min(impostor_scores)), 4),
-            'max': round(float(np.max(impostor_scores)), 4),
-        },
-        'separation_gap': round(float(np.mean(genuine_scores) - np.mean(impostor_scores)), 4),
+        'num_train_persons': int(frames['train'].person_id.nunique()),
+        'num_validation_images': int(len(frames['val'])),
+        'num_test_images': int(len(frames['test'])),
+        'num_validation_persons': int(frames['val'].person_id.nunique()),
+        'num_test_persons': int(frames['test'].person_id.nunique()),
+        'num_classes': int(frames['test'].label_idx.nunique()),
+        'num_validation_genuine_pairs': int(len(vg)),
+        'num_validation_impostor_pairs': int(len(vi)),
+        'num_genuine_pairs': int(len(tg)),
+        'num_impostor_pairs': int(len(ti)),
+        'validation_score_distributions_file': validation_path.name,
+        'score_distributions_file': test_path.name,
+        'validation_roc_auc': val_auc,
+        'validation_eer': val_eer,
+        'validation_eer_threshold': val_threshold,
+        'validation_metrics_at_eer': validation_metrics,
+        'test_roc_auc': test_auc,
+        'test_at_validation_eer': test_selected,
+        'test_at_fixed_threshold': test_fixed,
+        'target_far_operations': target_operations,
+        'subject_cluster_bootstrap': bootstrap,
+        'genuine_stats': {'mean': float(np.mean(tg)), 'std': float(np.std(tg)),
+                          'min': float(np.min(tg)), 'max': float(np.max(tg))},
+        'impostor_stats': {'mean': float(np.mean(ti)), 'std': float(np.std(ti)),
+                           'min': float(np.min(ti)), 'max': float(np.max(ti))},
+        'separation_gap': float(np.mean(tg) - np.mean(ti)),
+        'interpretation': [
+            'Train, validation, and test people are disjoint; validation selects the threshold and test estimates held-out performance.',
+            'The threshold used for test reporting is frozen from validation scores.',
+            'Pair scores reuse people and images; confidence intervals therefore resample people as clusters.',
+            'Low-FAR estimates are limited by the impostor-pair count and pair dependence.',
+            'This experiment measures identity verification, not presentation-attack detection.',
+        ],
     }
-    
-    report_path = output_dir / "evaluation_report.json"
-    with open(report_path, 'w') as f:
-        json.dump(report, f, indent=2)
-    
-    # Summary
-    print(f"\n   Files saved to: {output_dir}")
-    for f in sorted(output_dir.iterdir()):
-        size_kb = f.stat().st_size / 1024
-        print(f"     {f.name} ({size_kb:.1f} KB)")
-    
-    # Quality verdict
-    print("\n" + "=" * 65)
-    if eer < 0.005:
-        verdict = "EXCELLENT — System is production-ready"
-    elif eer < 0.01:
-        verdict = "VERY GOOD — Near production quality"
-    elif eer < 0.05:
-        verdict = "GOOD — Acceptable for most applications"
-    elif eer < 0.10:
-        verdict = "FAIR — Needs improvement for critical applications"
-    else:
-        verdict = "POOR — Requires significant improvement"
-    
-    print(f"   VERDICT: EER = {eer*100:.4f}% --> {verdict}")
-    print("=" * 65 + "\n")
+
+    plot_score_distributions(vg, vi, val_threshold, output_dir / 'score_distributions.png')
+    val_fpr, val_tpr, _ = compute_roc(vg, vi)
+    plot_roc_curve(val_fpr, val_tpr, val_auc, output_dir / 'roc_curve.png')
+    plot_far_frr(val_thresholds, val_far_curve, val_frr_curve, val_eer,
+                 val_threshold, output_dir / 'far_frr_analysis.png')
+    plot_det_curve(val_far_curve, val_frr_curve, val_eer, output_dir / 'det_curve.png')
+    plot_combined_dashboard(
+        vg, vi, val_thresholds, val_far_curve, val_frr_curve,
+        val_fpr, val_tpr, val_eer, val_threshold, val_auc,
+        {f'TAR@FAR={k}': 1 - select_target_far_threshold(vg, vi, k)[2]
+         for k in (0.01, 0.001)},
+        output_dir / 'evaluation_dashboard.png',
+    )
+    with (output_dir / 'evaluation_report.json').open('w', encoding='utf-8') as report_file:
+        json.dump(report, report_file, indent=2)
+    for private_output in output_dir.iterdir():
+        if private_output.is_file():
+            os.chmod(private_output, 0o600)
+
+    print('\nVALIDATION-SELECTED / TEST-EVALUATED RESULTS')
+    print(f"  Validation EER threshold: {val_threshold:.6f} (selected on validation)")
+    print(f"  Test at frozen threshold: FAR={test_selected['far']:.4%}, FRR={test_selected['frr']:.4%}, TAR={test_selected['tar']:.4%}")
+    print(f"  Test at fixed 0.75:       FAR={test_fixed['far']:.4%}, FRR={test_fixed['frr']:.4%}, TAR={test_fixed['tar']:.4%}")
+    print(f"  Test ROC AUC:             {test_auc:.6f}")
+    print(f"  Test pairs:               {len(tg):,} genuine / {len(ti):,} impostor")
+    print(f"  Subject bootstrap:        {args.bootstrap_repetitions} repetitions / {bootstrap['people']} people")
+    print(f"  Full report:              {output_dir / 'evaluation_report.json'}")
 
 
 if __name__ == "__main__":

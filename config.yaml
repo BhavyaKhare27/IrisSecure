@@ -5,6 +5,7 @@
 dataset:
   root_dir: "data/CASIA-Iris-Thousand"
   processed_dir: "data/processed"
+  subject_split_dir: "data/splits/subject_disjoint"
   csv_path: "data/processed/iris_dataset.csv"
   image_extensions: [".jpg", ".jpeg", ".png", ".bmp"]
 
@@ -38,6 +39,9 @@ model:
 training:
   batch_size: 32
   num_workers: 0                 # Set to 0 on Windows to avoid shared memory errors
+  seed: 42
+  run_name: "subject_disjoint_seed42"
+  output_root: "models/runs"
   learning_rate: 0.001
   epochs: 30                    # ArcFace typically converges in 20-30 epochs
   optimizer: "adam"
@@ -47,11 +51,13 @@ training:
 verification:
   similarity_metric: "cosine"   # Options: cosine, euclidean
   threshold: 0.75               # Acceptance threshold
+  validation_max_genuine_pairs_per_class: 10
+  validation_max_impostor_pairs: 50000
   
-# Database Configuration (for future steps)
+# Local database configuration
 database:
-  storage_format: "pickle"      # Options: pickle, json
-  db_path: "database/embeddings.pkl"
+  storage_format: "sqlite"
+  db_path: "database/irissecure.db"
 
 # Logging
 logging:

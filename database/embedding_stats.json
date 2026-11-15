@@ -1,19 +1,24 @@
 {
-  "total_embeddings": 20000,
-  "total_classes": 2000,
+  "total_embeddings": 3000,
+  "total_classes": 300,
   "embedding_dim": 512,
   "intra_class_similarity": {
-    "mean": 0.9729,
-    "std": 0.01,
-    "min": 0.8969,
-    "max": 0.9896
+    "mean": 0.7996760526845853,
+    "std": 0.13039242606675214,
+    "min": 0.2273593246936798,
+    "max": 0.9999999403953552
   },
   "inter_class_similarity": {
-    "mean": 0.0033,
-    "std": 0.1248,
-    "min": -0.5148,
-    "max": 0.4637
+    "mean": 0.007321527264745673,
+    "std": 0.13949750270057276,
+    "min": -0.4621233344078064,
+    "max": 0.716776430606842
   },
-  "separation_gap": 0.9696,
-  "embedding_norm_mean": 1.0
+  "separation_gap": 0.7923545254198396,
+  "embedding_norm_mean": 1.0,
+  "source": "subject-disjoint validation genuine/impostor pair scores",
+  "run_name": "subject_disjoint_seed42",
+  "checkpoint_sha256": "a90916232faa7a727871fb0467a5bfb2bed65376c5dcfcbf2a294d89d743e5ee",
+  "genuine_pair_count": 3000,
+  "impostor_pair_count": 50000
 }

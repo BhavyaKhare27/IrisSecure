@@ -18,6 +18,8 @@ venv/
 env/
 ENV/
 .env
+.env.*
+!.env.example
 node_modules/
 .next/
 web/AGENTS.md
@@ -25,14 +27,22 @@ web/AGENTS.md
 *.sqlite
 *.sqlite3
 database/irissecure.db
+database/*.db
+database/*.db-*
+database/*.sqlite*
+database/*.pkl
+database/*-wal
+database/*-shm
 
 # --- Dataset (too large for GitHub) ---
 data/CASIA-Iris-Thousand/
 data/processed/
+data/splits/
 iris_thousands.csv
 
 # --- Model Checkpoints (300MB+ each) ---
 models/checkpoints/
+models/runs/
 *.pth
 *.pt
 *.onnx

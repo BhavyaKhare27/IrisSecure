@@ -20,7 +20,7 @@ Output:
 
 Run:
     python generate_embeddings.py
-    python generate_embeddings.py --checkpoint models/checkpoints/best_model.pth
+    python generate_embeddings.py --checkpoint models/runs/subject_disjoint_seed42/checkpoints/best_model.pth
 """
 
 import os
@@ -88,17 +88,22 @@ def load_trained_model(checkpoint_path: str, device: torch.device):
     model = model.to(device)
     model.eval()
     
+    validation_metrics = checkpoint.get('validation_metrics', {})
     info = {
         'epoch': checkpoint.get('epoch', 'unknown'),
         'val_loss': checkpoint.get('val_loss', 'unknown'),
         'val_accuracy': checkpoint.get('val_accuracy', 'unknown'),
+        'val_eer': validation_metrics.get('eer', checkpoint.get('val_eer', 'unknown')),
+        'val_threshold': validation_metrics.get('threshold', 'unknown'),
         'num_classes': checkpoint.get('num_classes', 'unknown'),
+        'training_seed': checkpoint.get('training_seed'),
+        'split_metadata': checkpoint.get('split_metadata'),
         'backbone': model_cfg.get('backbone', 'resnet50'),
         'embedding_dim': model_cfg.get('embedding_dim', 512),
     }
     
     logger.info(f"Model loaded: epoch={info['epoch']}, "
-                f"val_acc={info['val_accuracy']}, "
+                f"val_eer={info['val_eer']}, "
                 f"backbone={info['backbone']}")
     
     return model, info
@@ -260,7 +265,7 @@ def main():
     
     # Checkpoint path
     checkpoint_path = args.checkpoint or str(
-        PROJECT_ROOT / "models" / "checkpoints" / "best_model.pth"
+        PROJECT_ROOT / "models" / "runs" / "subject_disjoint_seed42" / "checkpoints" / "best_model.pth"
     )
     
     if not Path(checkpoint_path).exists():
@@ -342,6 +347,7 @@ def main():
     embeddings_path = db_dir / "embeddings.pkl"
     with open(embeddings_path, 'wb') as f:
         pickle.dump(embedding_records, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.chmod(embeddings_path, 0o600)
     
     embeddings_size = embeddings_path.stat().st_size / (1024 * 1024)
     print(f"   Per-image embeddings saved: {embeddings_path} ({embeddings_size:.1f} MB)")
@@ -353,6 +359,7 @@ def main():
     gallery_path = db_dir / "gallery.pkl"
     with open(gallery_path, 'wb') as f:
         pickle.dump(gallery, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.chmod(gallery_path, 0o600)
     
     gallery_size = gallery_path.stat().st_size / (1024 * 1024)
     print(f"   Gallery saved: {gallery_path} ({gallery_size:.1f} MB)")
@@ -365,6 +372,7 @@ def main():
     stats_path = db_dir / "embedding_stats.json"
     with open(stats_path, 'w') as f:
         json.dump(stats, f, indent=2)
+    os.chmod(stats_path, 0o600)
     
     # Print quality report
     print("\n" + "=" * 65)

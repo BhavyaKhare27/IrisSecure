@@ -90,12 +90,12 @@ export default function Home() {
             if (!extracted.ok)
                 throw new Error(output.detail ?? "Embedding extraction failed");
             const response = await fetch(`${API}/api/identities/${encodeURIComponent(`${userId.trim()}_${eye}`)}?eye=${eye}&person_id=${encodeURIComponent(userId.trim())}`, {
-                method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ embedding: output.embedding }),
+                method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ embedding: output.embedding, model_fingerprint: output.model_fingerprint }),
             });
             const result = await response.json();
             if (!response.ok)
                 throw new Error(result.detail ?? "Registration failed");
-            setNotice(`Registered ${result.user_id}. The uploaded image was not retained.`);
+            setNotice(`${result.status === "re-enrolled" ? "Re-enrolled" : "Registered"} ${result.user_id}. The uploaded image was discarded after inference.`);
             setUserId("");
             setImage(null);
             await refresh();
@@ -129,18 +129,19 @@ export default function Home() {
             const output = await extracted.json();
             if (!extracted.ok)
                 throw new Error(output.detail ?? "Embedding extraction failed");
+            const threshold = calibration?.data_source === "empirical" ? calibration.threshold : 0.75;
             const endpoint = recognitionMode === "identify"
-                ? `${API}/api/identify?threshold=0.75`
-                : `${API}/api/verify/${encodeURIComponent(claimedId.trim())}?threshold=0.75`;
-            const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ embedding: output.embedding }) });
+                ? `${API}/api/identify?threshold=${threshold}`
+                : `${API}/api/verify/${encodeURIComponent(claimedId.trim())}?threshold=${threshold}`;
+            const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ embedding: output.embedding, model_fingerprint: output.model_fingerprint }) });
             const result = await response.json();
             if (!response.ok)
                 throw new Error(result.detail ?? "Recognition failed");
             const succeeded = recognitionMode === "identify" ? result.matched : result.verified;
             setRecognitionStatus(succeeded ? "success" : "failure");
             setRecognitionResult(recognitionMode === "identify"
-                ? result.matched ? `Identified ${result.user_id} · similarity ${result.similarity.toFixed(4)}` : `No match above threshold · best similarity ${result.similarity.toFixed(4)}`
-                : result.verified ? `Verified ${result.user_id} · similarity ${result.similarity.toFixed(4)}` : `Verification denied · similarity ${result.similarity.toFixed(4)}`);
+                ? result.matched ? `Identified ${result.user_id} · similarity ${result.similarity.toFixed(4)} · threshold ${threshold.toFixed(4)}` : `No match above threshold · best similarity ${result.similarity.toFixed(4)} · threshold ${threshold.toFixed(4)}`
+                : result.verified ? `Verified ${result.user_id} · similarity ${result.similarity.toFixed(4)} · threshold ${threshold.toFixed(4)}` : `Verification denied · similarity ${result.similarity.toFixed(4)} · threshold ${threshold.toFixed(4)}`);
         }
         catch (error) {
             setRecognitionStatus("failure");
@@ -151,6 +152,7 @@ export default function Home() {
         }
     }
     const ref = dashboard?.dataset_reference;
+    const heldout = dashboard?.heldout_evaluation;
     return <main className="shell">
     <aside className="rail">
       <div className="brand-mark">I<span>·</span></div>
@@ -168,22 +170,40 @@ export default function Home() {
           <article className="metric-card"><div className="metric-label">REGISTERED IDENTITIES <span className="metric-icon green">◉</span></div><div className="metric-value">{dashboard?.identity_count ?? "—"}</div><div className="metric-foot">Stored biometric templates</div></article>
           <article className="metric-card"><div className="metric-label">REFERENCE CLASSES <span className="metric-icon blue">▦</span></div><div className="metric-value">{ref?.classes?.toLocaleString() ?? "—"}</div><div className="metric-foot">CASIA-Iris-Thousand benchmark</div></article>
           <article className="metric-card"><div className="metric-label">EMBEDDING SIZE <span className="metric-icon violet">⌗</span></div><div className="metric-value">{ref?.embedding_dimension ?? 512}<small> dim</small></div><div className="metric-foot">L2-normalized feature vector</div></article>
-          <article className="metric-card"><div className="metric-label">MODEL STATUS <span className={`status-pill ${dashboard?.model_available ? "ready" : "pending"}`}>{dashboard?.model_available ? "READY" : "NOT TRAINED"}</span></div><div className={`model-state ${dashboard?.model_available ? "ready-text" : "pending-text"}`}>{dashboard?.model_available ? "Online" : "Setup required"}</div><div className="metric-foot">{dashboard?.model_available ? "Inference endpoint enabled" : "Add a trained checkpoint to enable capture"}</div></article>
+          <article className="metric-card"><div className="metric-label">ACTIVE MODEL <span className={`status-pill ${dashboard?.model_available ? "ready" : "pending"}`}>{dashboard?.model_available ? "READY" : "NOT TRAINED"}</span></div><div className={`model-state ${dashboard?.model_available ? "ready-text" : "pending-text"}`}>{dashboard?.model_available ? "Online" : "Setup required"}</div><div className="metric-foot">{dashboard?.stale_identity_count ? `${dashboard.stale_identity_count} saved identities need re-enrollment with the active model.` : dashboard?.candidate_model_active ? `Subject-disjoint model active · run ${dashboard.candidate_run_name}` : dashboard?.candidate_model_available ? `Subject-disjoint candidate ready · current model stays active` : dashboard?.model_available ? "Current demo model active · future training outputs stay separate" : "Add a trained checkpoint to enable capture"}</div></article>
         </div>
 
         <div className="main-grid" id="analytics">
           <article className="panel chart-panel"><div className="panel-head"><div><div className="eyebrow">STATISTICAL OPERATING POINT</div><h2>Verification error curve</h2><p>{calibration?.data_source === "empirical" ? `Measured on the ${calibration.split ?? "saved"} evaluation split` : "Estimate from aggregate reference score statistics"}</p></div><div className="optimizer-controls"><select aria-label="Threshold optimization objective" value={targetFar} onChange={e => setTargetFar(e.target.value)}><option value="eer">Balance FAR and FRR</option><option value="0.01">FAR ≤ 1%</option><option value="0.001">FAR ≤ 0.1%</option><option value="0.0001">FAR ≤ 0.01%</option></select><button className="primary-button" onClick={() => void optimize()} disabled={busy || apiState !== "online"}>{busy ? <><span className="spinner"/> Calibrating</> : "◎  Optimize threshold"}</button></div></div>
             <div className="chart-wrap">{calibration ? <ReactECharts option={chartOption} notMerge style={{ height: 285, width: "100%" }}/> : <div className="chart-empty">Waiting for score summaries…</div>}</div>
-            <div className="chart-foot"><span><i className="legend-dot red"/>False accept rate</span><span><i className="legend-dot blue"/>False reject rate</span><span className="chart-note">Aggregate-statistics estimate</span></div>
+            <div className="chart-foot"><span><i className="legend-dot red"/>False accept rate</span><span><i className="legend-dot blue"/>False reject rate</span><span className="chart-note">{calibration?.data_source === "empirical" ? "Validation calibration scores" : "Aggregate-statistics estimate"}</span></div>
           </article>
           <article className="panel calibration-panel"><div className="eyebrow">SUGGESTED OPERATING POINT</div><h2>Threshold calibration</h2><p className="muted">{calibration?.objective === "minimize_frr_at_target_far" ? `Minimizes false rejects while satisfying the ${((calibration.target_far ?? 0) * 100).toPrecision(3)}% FAR target.` : "Selects the point where FAR and FRR are closest."}</p><div className="threshold">{calibration ? calibration.threshold.toFixed(3) : "—"}</div><div className="threshold-caption">COSINE SIMILARITY THRESHOLD</div><div className="rate-list"><div><span>{calibration?.data_source === "empirical" ? "Empirical FAR" : "Estimated FAR"}</span><b>{calibration ? `${(calibration.estimated_far * 100).toPrecision(3)}%` : "—"}</b></div><div><span>{calibration?.data_source === "empirical" ? "Empirical FRR" : "Estimated FRR"}</span><b>{calibration ? `${(calibration.estimated_frr * 100).toPrecision(3)}%` : "—"}</b></div><div><span>{calibration?.data_source === "empirical" ? "Empirical EER" : "Estimated EER"}</span><b>{calibration ? `${(calibration.estimated_eer * 100).toPrecision(3)}%` : "—"}</b></div></div><div className="assumption">ⓘ {calibration?.data_source === "empirical" ? `Computed from ${calibration.split ?? "evaluation"} score pairs. These metrics are split-specific.` : <>Gaussian estimate from reference aggregates. Run <code>evaluate.py</code> with the dataset to use empirical scores.</>}</div></article>
         </div>
 
+        {heldout?.available && <article className="panel evidence-panel" id="evaluation">
+          <div className="panel-head compact"><div><div className="eyebrow">RESEARCH EVALUATION · HELD-OUT TEST</div><h2>Does threshold tuning improve on the fixed baseline?</h2><p>Threshold selected on validation scores, then frozen for test measurements.</p></div><span className="count-tag">{heldout.num_genuine_pairs?.toLocaleString()} genuine · {heldout.num_impostor_pairs?.toLocaleString()} impostor pairs</span></div>
+          <div className="evidence-metrics">
+            <div><span>TEST ROC-AUC</span><b>{heldout.test_roc_auc?.toFixed(6) ?? "—"}</b></div>
+            <div><span>VALIDATION-SELECTED THRESHOLD</span><b>{heldout.test_at_validation_eer?.threshold?.toFixed(4) ?? "—"}</b></div>
+            <div><span>FROZEN-THRESHOLD TEST TAR</span><b>{heldout.test_at_validation_eer ? `${(heldout.test_at_validation_eer.tar * 100).toFixed(2)}%` : "—"}</b></div>
+            <div><span>FIXED 0.75 TEST TAR</span><b>{heldout.test_at_fixed_threshold ? `${(heldout.test_at_fixed_threshold.tar * 100).toFixed(2)}%` : "—"}</b></div>
+          </div>
+          <div className="table-wrap evidence-table-wrap"><table><thead><tr><th>OPERATING POINT</th><th>THRESHOLD</th><th>TEST FAR</th><th>TEST FRR</th><th>TEST TAR</th><th>BALANCED ACCURACY</th></tr></thead><tbody>
+            {[
+              ['Validation-selected EER', heldout.test_at_validation_eer],
+              ['Fixed baseline (0.75)', heldout.test_at_fixed_threshold],
+              ...Object.entries(heldout.target_far_operations ?? {}).map(([target, operation]) => [`Validation target FAR ${(Number(target) * 100).toPrecision(3)}%`, operation.test_metrics_at_threshold]),
+            ].map(([label, metric]) => <tr key={label}><td>{label}</td><td>{metric?.threshold?.toFixed(4) ?? "—"}</td><td>{metric ? `${(metric.far * 100).toFixed(3)}%` : "—"}</td><td>{metric ? `${(metric.frr * 100).toFixed(3)}%` : "—"}</td><td>{metric ? `${(metric.tar * 100).toFixed(2)}%` : "—"}</td><td>{metric ? `${(metric.balanced_accuracy * 100).toFixed(2)}%` : "—"}</td></tr>)}
+          </tbody></table></div>
+          <div className="assumption">The observed FAR was 0 among {heldout.num_impostor_pairs?.toLocaleString()} sampled test comparisons; this does not establish a population FAR of zero. The subject-cluster bootstrap interval for test FRR at the validation-selected threshold is {(() => { const ci = heldout.subject_cluster_bootstrap?.intervals?.validation_eer?.frr; return ci ? `${(ci[0] * 100).toFixed(2)}%–${(ci[1] * 100).toFixed(2)}%` : "not available"; })()}. Training, validation, and test identities are subject-disjoint.</div>
+        </article>}
+
         <div className="lower-grid" id="gallery">
           <article className="panel gallery-panel"><div className="panel-head compact"><div><div className="eyebrow">IDENTITY NETWORK</div><h2>Recent registrations</h2></div><span className="count-tag">{identities.length} shown</span></div><div className="table-wrap"><table><thead><tr><th>IDENTITY</th><th>EYE</th><th>SAMPLES</th><th>REGISTERED</th></tr></thead><tbody>{identities.length ? identities.slice(0, 7).map(row => <tr key={row.user_id}><td><span className="identity-icon">{row.user_id.slice(0, 1).toUpperCase()}</span>{row.user_id}</td><td><span className="eye-tag">{row.eye || "—"}</span></td><td>{row.num_samples}</td><td>{new Date(row.created_at).toLocaleDateString()}</td></tr>) : <tr><td colSpan={4} className="empty-cell">No identities registered yet.</td></tr>}</tbody></table></div></article>
-          <article className="panel register-panel"><div className="eyebrow">ENROLLMENT</div><h2>Register an identity</h2><p className="muted">Images are processed in memory. Only the embedding is stored.</p><form onSubmit={register}><label>Identity ID<input value={userId} onChange={e => setUserId(e.target.value)} placeholder="e.g. participant-042"/></label><div className="form-row"><label>Eye<select value={eye} onChange={e => setEye(e.target.value)}><option value="L">Left eye</option><option value="R">Right eye</option></select></label><label className="file-label">Iris image<input type="file" accept="image/*" onChange={e => setImage(e.target.files?.[0] ?? null)}/></label></div><button className="primary-button full" disabled={busy || !dashboard?.model_available}>{busy ? "Working…" : "＋  Enroll identity"}</button>{!dashboard?.model_available && <div className="small-help">Training a model checkpoint is required before enrollment.</div>}</form></article>
+          <article className="panel register-panel"><div className="eyebrow">ENROLLMENT</div><h2>Register an identity</h2><p className="muted">Images are discarded after inference; a model-tagged embedding is stored.</p><form onSubmit={register}><label>Identity ID<input value={userId} onChange={e => setUserId(e.target.value)} placeholder="e.g. participant-042"/></label><div className="form-row"><label>Eye<select value={eye} onChange={e => setEye(e.target.value)}><option value="L">Left eye</option><option value="R">Right eye</option></select></label><label className="file-label">Iris image<input type="file" accept="image/*" onChange={e => setImage(e.target.files?.[0] ?? null)}/></label></div><button className="primary-button full" disabled={busy || !dashboard?.model_available}>{busy ? "Working…" : "＋  Enroll identity"}</button>{!dashboard?.model_available && <div className="small-help">Training a model checkpoint is required before enrollment.</div>}</form></article>
         </div>
-        <article className="panel recognition-panel"><div><div className="eyebrow">LIVE INFERENCE</div><h2>Identify or verify an iris</h2><p className="muted">Images are processed in memory. The source image is not saved.</p></div><form onSubmit={recognize} className="recognition-form"><label>Mode<select value={recognitionMode} onChange={e => setRecognitionMode(e.target.value)}><option value="identify">Identify · search gallery</option><option value="verify">Verify · 1:1 claim</option></select></label>{recognitionMode === "verify" && <label>Claimed identity<select value={claimedId} onChange={e => setClaimedId(e.target.value)}><option value="">Choose identity</option>{identities.map(identity => <option key={identity.user_id} value={identity.user_id}>{identity.user_id}</option>)}</select></label>}<label className="recognition-file">Iris image<input type="file" accept="image/*" onChange={e => setRecognitionImage(e.target.files?.[0] ?? null)}/></label><button className="primary-button" disabled={busy || !dashboard?.model_available}>{busy ? "Processing…" : "◉  Run recognition"}</button></form>{recognitionResult && <div className={`recognition-result ${recognitionStatus}`}>{recognitionResult}</div>}</article>
+        <article className="panel recognition-panel"><div><div className="eyebrow">LIVE INFERENCE</div><h2>Identify or verify an iris</h2><p className="muted">The uploaded image is discarded after inference; it is not stored in the gallery.</p></div><form onSubmit={recognize} className="recognition-form"><label>Mode<select value={recognitionMode} onChange={e => setRecognitionMode(e.target.value)}><option value="identify">Identify · search gallery</option><option value="verify">Verify · 1:1 claim</option></select></label>{recognitionMode === "verify" && <label>Claimed identity<select value={claimedId} onChange={e => setClaimedId(e.target.value)}><option value="">Choose identity</option>{identities.map(identity => <option key={identity.user_id} value={identity.user_id}>{identity.user_id}</option>)}</select></label>}<label className="recognition-file">Iris image<input type="file" accept="image/*" onChange={e => setRecognitionImage(e.target.files?.[0] ?? null)}/></label><button className="primary-button" disabled={busy || !dashboard?.model_available}>{busy ? "Processing…" : "◉  Run recognition"}</button></form>{recognitionResult && <div className={`recognition-result ${recognitionStatus}`}>{recognitionResult}</div>}</article>
         <footer><span>IRISSECURE <b>2.0</b> · BIOMETRIC R&amp;D PLATFORM</span><span>FastAPI · Next.js · SQLite · ECharts</span></footer>
       </div>
     </section>

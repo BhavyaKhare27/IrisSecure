@@ -25,6 +25,7 @@ Run:
 import os
 import sys
 import time
+import random
 import argparse
 import logging
 import yaml
@@ -53,6 +54,7 @@ from utils.preprocessing import (
     get_val_transforms,
     create_dataloaders
 )
+from utils.similarity import generate_verification_scores, select_eer_threshold
 
 # Configure logging
 logging.basicConfig(
@@ -64,28 +66,28 @@ logger = logging.getLogger(__name__)
 
 
 class EarlyStopping:
-    """Early stopping to halt training when validation loss stops improving."""
+    """Early stopping to halt when a minimized validation metric stops improving."""
     
     def __init__(self, patience: int = 7, min_delta: float = 1e-4, verbose: bool = True):
         self.patience = patience
         self.min_delta = min_delta
         self.verbose = verbose
         self.counter = 0
-        self.best_loss = None
+        self.best_score = None
         self.should_stop = False
         
-    def __call__(self, val_loss: float) -> bool:
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
+    def __call__(self, score: float) -> bool:
+        if self.best_score is None:
+            self.best_score = score
+        elif score > self.best_score - self.min_delta:
             self.counter += 1
             if self.verbose:
                 logger.info(f"EarlyStopping: {self.counter}/{self.patience} "
-                           f"(best: {self.best_loss:.4f}, current: {val_loss:.4f})")
+                           f"(best: {self.best_score:.4f}, current: {score:.4f})")
             if self.counter >= self.patience:
                 self.should_stop = True
         else:
-            self.best_loss = val_loss
+            self.best_score = score
             self.counter = 0
         return self.should_stop
 
@@ -98,7 +100,7 @@ class Trainer:
         - Model & loss setup
         - Optimizer & scheduler configuration  
         - Training loop with mixed precision
-        - Validation with accuracy tracking
+        - Validation with unseen-identity verification metrics
         - Checkpointing & early stopping
     """
     
@@ -106,17 +108,44 @@ class Trainer:
         self.config = config
         self.device = device
         self.start_time = datetime.now()
-        
-        # Paths
-        self.model_dir = PROJECT_ROOT / "models" / "checkpoints"
+
+        # Seed all RNGs used by the training/data pipeline for a repeatable run.
+        self.seed = int(self.config['training'].get('seed', 42))
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
+
+        run_name = str(self.config['training'].get('run_name', 'subject_disjoint_run'))
+        if not run_name or Path(run_name).name != run_name or run_name in {'.', '..'}:
+            raise ValueError("training.run_name must be a single, non-empty directory name")
+
+        # Keep future experiment checkpoints separate from the deployed checkpoint.
+        output_root = PROJECT_ROOT / self.config['training'].get('output_root', 'models/runs')
+        self.run_dir = output_root / run_name
+        self.model_dir = self.run_dir / "checkpoints"
+        self.log_dir = PROJECT_ROOT / self.config.get('logging', {}).get('log_dir', 'logs') / run_name
+
+        # Never silently overwrite artifacts from a prior run with this name.
+        if self.model_dir.exists() and any(self.model_dir.iterdir()):
+            raise FileExistsError(
+                f"Training output already exists at {self.model_dir}. "
+                "Choose a new training.run_name to preserve prior run artifacts."
+            )
+        history_path = self.log_dir / "training_history.json"
+        if history_path.exists():
+            raise FileExistsError(
+                f"Training history already exists at {history_path}. "
+                "Choose a new training.run_name to preserve prior run artifacts."
+            )
+
         self.model_dir.mkdir(parents=True, exist_ok=True)
-        self.log_dir = PROJECT_ROOT / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
         # Training state
         self.current_epoch = 0
-        self.best_val_loss = float('inf')
-        self.best_val_acc = 0.0
+        self.best_val_eer = float('inf')
         self.training_history = []
         
     def setup_model(self):
@@ -134,11 +163,9 @@ class Trainer:
         )
         
         # --- ArcFace Loss ---
-        # Load number of classes from label mapping
-        label_mapping = pd.read_csv(
-            PROJECT_ROOT / self.config['dataset']['processed_dir'] / "label_mapping.csv"
-        )
-        self.num_classes = len(label_mapping)
+        # The training-only label map is created from the train manifest.
+        if not getattr(self, 'num_classes', 0):
+            raise RuntimeError("Load the subject-disjoint training split before building ArcFace loss")
         
         self.criterion = ArcFaceLoss(
             embedding_dim=model_cfg['embedding_dim'],
@@ -193,15 +220,60 @@ class Trainer:
                     f"device={self.device}")
     
     def setup_data(self):
-        """Load preprocessed data splits and create DataLoaders."""
-        processed_dir = PROJECT_ROOT / self.config['dataset']['processed_dir']
+        """Load person-disjoint manifests and map ArcFace labels from train identities only."""
+        split_dir = PROJECT_ROOT / self.config['dataset'].get(
+            'subject_split_dir', 'data/splits/subject_disjoint'
+        )
         pp_cfg = self.config['preprocessing']
         train_cfg = self.config['training']
-        
-        # Load split CSVs from Phase 1
-        train_df = pd.read_csv(processed_dir / "train.csv")
-        val_df = pd.read_csv(processed_dir / "val.csv")
-        test_df = pd.read_csv(processed_dir / "test.csv")
+
+        required_columns = {'person_id', 'eye', 'label', 'image_path', 'label_idx'}
+        train_df = pd.read_csv(split_dir / 'train.csv', dtype={'person_id': str})
+        val_df = pd.read_csv(split_dir / 'val.csv', dtype={'person_id': str})
+        test_df = pd.read_csv(split_dir / 'test.csv', dtype={'person_id': str})
+        for split_name, frame in (('train', train_df), ('val', val_df), ('test', test_df)):
+            missing = required_columns - set(frame.columns)
+            if missing:
+                raise ValueError(f"{split_name} manifest is missing columns: {sorted(missing)}")
+
+        # ArcFace class IDs are contiguous and derived only from training identities.
+        train_index = pd.to_numeric(train_df['training_class_idx'], errors='raise').astype(int)
+        train_classes = train_df[['label', 'training_class_idx']].drop_duplicates()
+        train_classes['training_class_idx'] = pd.to_numeric(
+            train_classes['training_class_idx'], errors='raise'
+        ).astype(int)
+        if train_classes['label'].duplicated().any() or train_classes['training_class_idx'].duplicated().any():
+            raise ValueError("Training label mapping is not one-to-one")
+        expected_indices = set(range(train_classes['training_class_idx'].nunique()))
+        if set(train_classes['training_class_idx']) != expected_indices:
+            raise ValueError("Training class indices must be contiguous, starting at zero")
+        train_df['label_idx'] = train_index
+        self.training_class_mapping = dict(zip(
+            train_classes['label'], train_classes['training_class_idx']
+        ))
+        self.num_classes = len(self.training_class_mapping)
+
+        # Validation and test retain their global identity-eye labels for verification.
+        for split_name, frame in (('val', val_df), ('test', test_df)):
+            frame['label_idx'] = pd.to_numeric(frame['label_idx'], errors='raise').astype(int)
+
+        subject_sets = {
+            name: set(frame['label'].astype(str).str.rsplit('_', n=1).str[0])
+            for name, frame in (('train', train_df), ('val', val_df), ('test', test_df))
+        }
+        for left, right in (('train', 'val'), ('train', 'test'), ('val', 'test')):
+            overlap = subject_sets[left] & subject_sets[right]
+            if overlap:
+                raise ValueError(f"Subject leakage between {left} and {right}: {len(overlap)} people")
+
+        # Resolve portable manifest paths against the project root before DataLoader use.
+        for frame in (train_df, val_df, test_df):
+            frame['image_path'] = frame['image_path'].map(
+                lambda value: str((PROJECT_ROOT / value).resolve())
+                if not Path(value).is_absolute() else value
+            )
+
+        self.split_metadata = json.loads((split_dir / 'split_metadata.json').read_text(encoding='utf-8'))
         
         image_size = tuple(pp_cfg['image_size'])
         
@@ -213,7 +285,12 @@ class Trainer:
             preprocessing_config=pp_cfg
         )
         
-        logger.info(f"Data loaded: train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
+        logger.info(
+            "Subject-disjoint data loaded: "
+            f"train={len(train_df)} images/{self.num_classes} training classes, "
+            f"val={len(val_df)} images/{val_df['label'].nunique()} unseen classes, "
+            f"test={len(test_df)} images/{test_df['label'].nunique()} unseen classes"
+        )
     
     def train_one_epoch(self, epoch: int) -> dict:
         """
@@ -282,38 +359,47 @@ class Trainer:
     @torch.no_grad()
     def validate(self, epoch: int) -> dict:
         """
-        Run validation and compute metrics.
+        Measure genuine/impostor verification performance on unseen identities.
         
         Returns:
-            Dict with validation metrics
+            Dict with EER, selected threshold, FAR/FRR, and pair counts.
         """
         self.model.eval()
-        self.criterion.eval()
-        
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        
-        for images, labels in tqdm(self.val_loader, desc="Validating", 
-                                    ncols=100, leave=False):
+        embeddings_all = []
+        labels_all = []
+
+        for images, labels in tqdm(self.val_loader, desc="Validating unseen identities",
+                                   ncols=100, leave=False):
             images = images.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
-            
             with autocast(device_type='cuda', enabled=self.device.type == 'cuda'):
                 embeddings = self.model(images, normalize=True)
-                loss = self.criterion(embeddings, labels)
-            
-            running_loss += loss.item() * images.size(0)
-            
-            cosine_sim = self.criterion.get_cosine_similarities(embeddings)
-            _, predicted = cosine_sim.max(1)
-            correct += predicted.eq(labels).sum().item()
-            total += labels.size(0)
-        
-        val_loss = running_loss / total
-        val_acc = 100. * correct / total
-        
-        return {'loss': val_loss, 'accuracy': val_acc}
+            embeddings_all.append(embeddings.float().cpu().numpy())
+            labels_all.append(labels.numpy())
+
+        embeddings_all = np.concatenate(embeddings_all, axis=0)
+        labels_all = np.concatenate(labels_all, axis=0)
+        manifest_labels = self.val_loader.dataset.dataframe['label_idx'].to_numpy(dtype=np.int64)
+        if not np.array_equal(labels_all.astype(np.int64), manifest_labels):
+            raise ValueError("Validation loader order no longer matches its identity manifest")
+
+        verification_cfg = self.config.get('verification', {})
+        genuine_scores, impostor_scores = generate_verification_scores(
+            embeddings_all,
+            labels_all,
+            max_genuine_per_class=verification_cfg.get(
+                'validation_max_genuine_pairs_per_class', 10
+            ),
+            max_impostor_pairs=verification_cfg.get('validation_max_impostor_pairs', 50000),
+            seed=self.seed,
+        )
+        metrics = select_eer_threshold(genuine_scores, impostor_scores)
+        logger.info(
+            "Unseen-identity validation: EER=%.4f, threshold=%.4f, FAR=%.4f, FRR=%.4f "
+            "(%s genuine / %s impostor pairs)",
+            metrics['eer'], metrics['threshold'], metrics['far'], metrics['frr'],
+            metrics['num_genuine_pairs'], metrics['num_impostor_pairs']
+        )
+        return metrics
     
     def save_checkpoint(self, epoch: int, val_metrics: dict, is_best: bool = False):
         """Save model checkpoint."""
@@ -324,10 +410,11 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
-            'val_loss': val_metrics['loss'],
-            'val_accuracy': val_metrics['accuracy'],
+            'validation_metrics': val_metrics,
             'config': self.config,
             'num_classes': self.num_classes,
+            'training_seed': self.seed,
+            'split_metadata': self.split_metadata,
         }
         
         # Save periodic checkpoint
@@ -337,8 +424,8 @@ class Trainer:
         if is_best:
             best_path = self.model_dir / "best_model.pth"
             torch.save(checkpoint, best_path)
-            logger.info(f"Best model saved: val_loss={val_metrics['loss']:.4f}, "
-                       f"val_acc={val_metrics['accuracy']:.2f}%")
+            logger.info(f"Best model saved: validation EER={val_metrics['eer']:.4f}, "
+                        f"threshold={val_metrics['threshold']:.4f}")
         
         # Keep only last 3 periodic checkpoints to save disk space
         checkpoints = sorted(self.model_dir.glob("checkpoint_epoch_*.pth"))
@@ -364,6 +451,7 @@ class Trainer:
         print(f"   Epochs:      {epochs} (freeze backbone: first {freeze_epochs})")
         print(f"   Batch Size:  {self.config['training']['batch_size']}")
         print(f"   Optimizer:   {self.config['training']['optimizer']}")
+        print(f"   Validation:  unseen-identity verification EER")
         print(f"   ArcFace:     scale=30.0, margin=0.5 rad")
         print(f"   Mixed Prec:  FP16 enabled")
         print("=" * 70 + "\n")
@@ -387,17 +475,16 @@ class Trainer:
             
             # Scheduler step
             if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                self.scheduler.step(val_metrics['loss'])
+                self.scheduler.step(val_metrics['eer'])
             else:
                 self.scheduler.step()
             
             epoch_time = time.time() - epoch_start
             
             # Check if best
-            is_best = val_metrics['loss'] < self.best_val_loss
+            is_best = val_metrics['eer'] < self.best_val_eer
             if is_best:
-                self.best_val_loss = val_metrics['loss']
-                self.best_val_acc = val_metrics['accuracy']
+                self.best_val_eer = val_metrics['eer']
             
             # Save checkpoint
             self.save_checkpoint(epoch, val_metrics, is_best)
@@ -407,8 +494,10 @@ class Trainer:
                 'epoch': epoch + 1,
                 'train_loss': round(train_metrics['loss'], 4),
                 'train_acc': round(train_metrics['accuracy'], 2),
-                'val_loss': round(val_metrics['loss'], 4),
-                'val_acc': round(val_metrics['accuracy'], 2),
+                'val_eer': round(val_metrics['eer'], 6),
+                'val_threshold': round(val_metrics['threshold'], 6),
+                'val_far': round(val_metrics['far'], 6),
+                'val_frr': round(val_metrics['frr'], 6),
                 'lr': self.optimizer.param_groups[0]['lr'],
                 'time': round(epoch_time, 1),
                 'best': is_best,
@@ -419,12 +508,13 @@ class Trainer:
             print(f"   Epoch {epoch+1:3d}/{epochs} | "
                   f"Train Loss: {train_metrics['loss']:.4f} | "
                   f"Train Acc: {train_metrics['accuracy']:.1f}% | "
-                  f"Val Loss: {val_metrics['loss']:.4f} | "
-                  f"Val Acc: {val_metrics['accuracy']:.1f}% | "
+                  f"Val EER: {val_metrics['eer']:.4f} | "
+                  f"FAR: {val_metrics['far']:.4f} | "
+                  f"FRR: {val_metrics['frr']:.4f} | "
                   f"Time: {epoch_time:.0f}s{best_marker}")
             
             # Early stopping check
-            if self.early_stopping(val_metrics['loss']):
+            if self.early_stopping(val_metrics['eer']):
                 logger.info(f"Early stopping triggered at epoch {epoch+1}")
                 print(f"\n   >> Early stopping at epoch {epoch+1}")
                 break
@@ -439,8 +529,7 @@ class Trainer:
         print("\n" + "=" * 70)
         print("   Training Complete!")
         print("=" * 70)
-        print(f"   Best Val Loss:     {self.best_val_loss:.4f}")
-        print(f"   Best Val Accuracy: {self.best_val_acc:.2f}%")
+        print(f"   Best Validation EER: {self.best_val_eer:.4f}")
         print(f"   Total Time:        {total_time/60:.1f} minutes")
         print(f"   Best Model:        {self.model_dir / 'best_model.pth'}")
         print(f"   Training Log:      {history_path}")
@@ -499,8 +588,8 @@ def main():
     
     # Initialize trainer
     trainer = Trainer(config, device)
-    trainer.setup_model()
     trainer.setup_data()
+    trainer.setup_model()
     
     # Train
     history = trainer.train()
