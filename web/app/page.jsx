@@ -18,6 +18,7 @@ export default function Home() {
     const [recognitionResult, setRecognitionResult] = useState("");
     const [recognitionStatus, setRecognitionStatus] = useState("");
     const [targetFar, setTargetFar] = useState("eer");
+    const [deletingId, setDeletingId] = useState("");
     const refresh = useCallback(async () => {
         try {
             const [health, stats, gallery, operatingPoint] = await Promise.all([
@@ -105,6 +106,29 @@ export default function Home() {
         }
         finally {
             setBusy(false);
+        }
+    }
+    async function deleteIdentity(identity) {
+        if (!window.confirm(`Delete ${identity.user_id} from the registered identity gallery?`))
+            return;
+        setDeletingId(identity.user_id);
+        setNotice("");
+        try {
+            const response = await fetch(`${API}/api/identities/${encodeURIComponent(identity.user_id)}`, { method: "DELETE" });
+            if (!response.ok) {
+                const result = await response.json().catch(() => ({}));
+                throw new Error(result.detail ?? "Could not delete identity.");
+            }
+            if (claimedId === identity.user_id)
+                setClaimedId("");
+            setNotice(`Deleted ${identity.user_id} from the gallery.`);
+            await refresh();
+        }
+        catch (error) {
+            setNotice(error instanceof Error ? error.message : "Could not delete identity.");
+        }
+        finally {
+            setDeletingId("");
         }
     }
     async function recognize(event) {
@@ -200,7 +224,7 @@ export default function Home() {
         </article>}
 
         <div className="lower-grid" id="gallery">
-          <article className="panel gallery-panel"><div className="panel-head compact"><div><div className="eyebrow">IDENTITY NETWORK</div><h2>Recent registrations</h2></div><span className="count-tag">{identities.length} shown</span></div><div className="table-wrap"><table><thead><tr><th>IDENTITY</th><th>EYE</th><th>SAMPLES</th><th>REGISTERED</th></tr></thead><tbody>{identities.length ? identities.slice(0, 7).map(row => <tr key={row.user_id}><td><span className="identity-icon">{row.user_id.slice(0, 1).toUpperCase()}</span>{row.user_id}</td><td><span className="eye-tag">{row.eye || "—"}</span></td><td>{row.num_samples}</td><td>{new Date(row.created_at).toLocaleDateString()}</td></tr>) : <tr><td colSpan={4} className="empty-cell">No identities registered yet.</td></tr>}</tbody></table></div></article>
+          <article className="panel gallery-panel"><div className="panel-head compact"><div><div className="eyebrow">IDENTITY NETWORK</div><h2>Recent registrations</h2></div><span className="count-tag">{identities.length} shown</span></div><div className="table-wrap"><table><thead><tr><th>IDENTITY</th><th>EYE</th><th>SAMPLES</th><th>REGISTERED</th><th>ACTION</th></tr></thead><tbody>{identities.length ? identities.slice(0, 7).map(row => <tr key={row.user_id}><td><span className="identity-icon">{row.user_id.slice(0, 1).toUpperCase()}</span>{row.user_id}</td><td><span className="eye-tag">{row.eye || "—"}</span></td><td>{row.num_samples}</td><td>{new Date(row.created_at).toLocaleDateString()}</td><td><button className="delete-button" type="button" disabled={Boolean(deletingId)} onClick={() => deleteIdentity(row)} aria-label={`Delete ${row.user_id}`} title={`Delete ${row.user_id}`}>{deletingId === row.user_id ? "Deleting…" : "Delete"}</button></td></tr>) : <tr><td colSpan={5} className="empty-cell">No identities registered yet.</td></tr>}</tbody></table></div></article>
           <article className="panel register-panel"><div className="eyebrow">ENROLLMENT</div><h2>Register an identity</h2><p className="muted">Images are discarded after inference; a model-tagged embedding is stored.</p><form onSubmit={register}><label>Identity ID<input value={userId} onChange={e => setUserId(e.target.value)} placeholder="e.g. participant-042"/></label><div className="form-row"><label>Eye<select value={eye} onChange={e => setEye(e.target.value)}><option value="L">Left eye</option><option value="R">Right eye</option></select></label><label className="file-label">Iris image<input type="file" accept="image/*" onChange={e => setImage(e.target.files?.[0] ?? null)}/></label></div><button className="primary-button full" disabled={busy || !dashboard?.model_available}>{busy ? "Working…" : "＋  Enroll identity"}</button>{!dashboard?.model_available && <div className="small-help">Training a model checkpoint is required before enrollment.</div>}</form></article>
         </div>
         <article className="panel recognition-panel"><div><div className="eyebrow">LIVE INFERENCE</div><h2>Identify or verify an iris</h2><p className="muted">The uploaded image is discarded after inference; it is not stored in the gallery.</p></div><form onSubmit={recognize} className="recognition-form"><label>Mode<select value={recognitionMode} onChange={e => setRecognitionMode(e.target.value)}><option value="identify">Identify · search gallery</option><option value="verify">Verify · 1:1 claim</option></select></label>{recognitionMode === "verify" && <label>Claimed identity<select value={claimedId} onChange={e => setClaimedId(e.target.value)}><option value="">Choose identity</option>{identities.map(identity => <option key={identity.user_id} value={identity.user_id}>{identity.user_id}</option>)}</select></label>}<label className="recognition-file">Iris image<input type="file" accept="image/*" onChange={e => setRecognitionImage(e.target.files?.[0] ?? null)}/></label><button className="primary-button" disabled={busy || !dashboard?.model_available}>{busy ? "Processing…" : "◉  Run recognition"}</button></form>{recognitionResult && <div className={`recognition-result ${recognitionStatus}`}>{recognitionResult}</div>}</article>
