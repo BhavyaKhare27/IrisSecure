@@ -1,235 +1,684 @@
 "use client";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import ReactECharts from "echarts-for-react";
+import { useCallback, useEffect, useState } from "react";
+
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
 export default function Home() {
-    const [dashboard, setDashboard] = useState(null);
-    const [identities, setIdentities] = useState([]);
-    const [calibration, setCalibration] = useState(null);
+    const [activeTab, setActiveTab] = useState("verify");
     const [apiState, setApiState] = useState("loading");
     const [busy, setBusy] = useState(false);
-    const [notice, setNotice] = useState("");
-    const [userId, setUserId] = useState("");
-    const [eye, setEye] = useState("L");
-    const [image, setImage] = useState(null);
-    const [recognitionImage, setRecognitionImage] = useState(null);
-    const [recognitionMode, setRecognitionMode] = useState("identify");
+    const [dashboard, setDashboard] = useState(null);
+    const [identities, setIdentities] = useState([]);
+    const [notice, setNotice] = useState(null);
+
+    // Authenticate (Scanner) State
+    const [probeFile, setProbeFile] = useState(null);
+    const [probePreview, setProbePreview] = useState(null);
+    const [verifyMode, setVerifyMode] = useState("identify");
     const [claimedId, setClaimedId] = useState("");
-    const [recognitionResult, setRecognitionResult] = useState("");
-    const [recognitionStatus, setRecognitionStatus] = useState("");
-    const [targetFar, setTargetFar] = useState("eer");
+    const [threshold, setThreshold] = useState(0.75);
+    const [verifyResult, setVerifyResult] = useState(null);
+
+    // Enroll State
+    const [enrollId, setEnrollId] = useState("");
+    const [enrollEye, setEnrollEye] = useState("L");
+    const [enrollFile, setEnrollFile] = useState(null);
+    const [enrollPreview, setEnrollPreview] = useState(null);
+
+    // Directory State
+    const [searchQuery, setSearchQuery] = useState("");
     const [deletingId, setDeletingId] = useState("");
+
     const refresh = useCallback(async () => {
         try {
-            const [health, stats, gallery, operatingPoint] = await Promise.all([
-                fetch(`${API}/api/health`), fetch(`${API}/api/dashboard`),
-                fetch(`${API}/api/identities`), fetch(`${API}/api/analytics/threshold`),
+            const [health, stats, gallery] = await Promise.all([
+                fetch(`${API}/api/health`),
+                fetch(`${API}/api/dashboard`),
+                fetch(`${API}/api/identities`),
             ]);
-            if (!health.ok || !stats.ok || !gallery.ok)
-                throw new Error("API unavailable");
+            if (!health.ok || !stats.ok || !gallery.ok) throw new Error("API unavailable");
             setDashboard(await stats.json());
             setIdentities(await gallery.json());
-            if (operatingPoint.ok)
-                setCalibration(await operatingPoint.json());
             setApiState("online");
-        }
-        catch {
+        } catch {
             setApiState("offline");
         }
     }, []);
-    useEffect(() => { void refresh(); }, [refresh]);
-    const chartOption = useMemo(() => ({
-        backgroundColor: "transparent",
-        tooltip: { trigger: "axis", backgroundColor: "#111a2c", borderColor: "#263650", textStyle: { color: "#eaf0fc" } },
-        legend: { top: 0, right: 4, textStyle: { color: "#8d9bb2" }, itemWidth: 8, itemHeight: 8 },
-        grid: { left: 44, right: 18, top: 42, bottom: 34 },
-        xAxis: { type: "value", min: -1, max: 1, name: "Cosine threshold", nameTextStyle: { color: "#71809a" }, axisLabel: { color: "#71809a" }, splitLine: { lineStyle: { color: "#1d2a40" } } },
-        yAxis: { type: "log", min: 0.000001, max: 1, name: "Error rate", nameTextStyle: { color: "#71809a" }, axisLabel: { color: "#71809a", formatter: (value) => `${(value * 100).toPrecision(1)}%` }, splitLine: { lineStyle: { color: "#1d2a40" } } },
-        series: calibration ? [
-            { name: "False accept", type: "line", smooth: true, showSymbol: false, data: calibration.curve.map(p => [p.threshold, Math.max(p.far, 0.000001)]), lineStyle: { width: 2, color: "#ff7c7c" }, areaStyle: { color: "rgba(255,124,124,.06)" } },
-            { name: "False reject", type: "line", smooth: true, showSymbol: false, data: calibration.curve.map(p => [p.threshold, Math.max(p.frr, 0.000001)]), lineStyle: { width: 2, color: "#66b6ff" } },
-        ] : [],
-    }), [calibration]);
-    async function optimize() {
-        setBusy(true);
-        setNotice("");
-        try {
-            const query = targetFar === "eer" ? "" : `?target_far=${targetFar}`;
-            const queued = await fetch(`${API}/api/analytics/optimize${query}`, { method: "POST" }).then(r => r.json());
-            for (let attempt = 0; attempt < 30; attempt++) {
-                await new Promise(resolve => setTimeout(resolve, 700));
-                const job = await fetch(`${API}/api/jobs/${queued.job_id}`).then(r => r.json());
-                if (job.status === "completed") {
-                    setCalibration(job.result);
-                    setNotice("Threshold calibration complete.");
-                    break;
-                }
-                if (job.status === "failed")
-                    throw new Error(job.error ?? "Calibration failed");
-            }
-        }
-        catch (error) {
-            setNotice(error instanceof Error ? error.message : "Could not run calibration.");
-        }
-        finally {
-            setBusy(false);
-        }
-    }
-    async function register(event) {
-        event.preventDefault();
-        if (!image || !userId.trim()) {
-            setNotice("Choose an iris image and enter an identity ID.");
+
+    useEffect(() => {
+        void refresh();
+    }, [refresh]);
+
+    const handleProbeSelect = (file) => {
+        if (!file) return;
+        if (probePreview) URL.revokeObjectURL(probePreview);
+        setProbeFile(file);
+        setProbePreview(URL.createObjectURL(file));
+        setVerifyResult(null);
+    };
+
+    const clearProbe = () => {
+        if (probePreview) URL.revokeObjectURL(probePreview);
+        setProbeFile(null);
+        setProbePreview(null);
+        setVerifyResult(null);
+    };
+
+    const handleEnrollFileSelect = (file) => {
+        if (!file) return;
+        if (enrollPreview) URL.revokeObjectURL(enrollPreview);
+        setEnrollFile(file);
+        setEnrollPreview(URL.createObjectURL(file));
+    };
+
+    const clearEnrollFile = () => {
+        if (enrollPreview) URL.revokeObjectURL(enrollPreview);
+        setEnrollFile(null);
+        setEnrollPreview(null);
+    };
+
+    const runVerification = async (e) => {
+        e.preventDefault();
+        if (!probeFile) {
+            setNotice({ type: "error", message: "Select or drop an iris image first." });
             return;
         }
+        if (verifyMode === "verify" && !claimedId.trim()) {
+            setNotice({ type: "error", message: "Choose an enrolled identity to verify against." });
+            return;
+        }
+
         setBusy(true);
-        setNotice("");
+        setNotice(null);
+        setVerifyResult(null);
+
         try {
             const form = new FormData();
-            form.append("image", image);
-            const extracted = await fetch(`${API}/api/recognition/embedding`, { method: "POST", body: form });
-            const output = await extracted.json();
-            if (!extracted.ok)
-                throw new Error(output.detail ?? "Embedding extraction failed");
-            const response = await fetch(`${API}/api/identities/${encodeURIComponent(`${userId.trim()}_${eye}`)}?eye=${eye}&person_id=${encodeURIComponent(userId.trim())}`, {
-                method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ embedding: output.embedding, model_fingerprint: output.model_fingerprint }),
-            });
-            const result = await response.json();
-            if (!response.ok)
-                throw new Error(result.detail ?? "Registration failed");
-            setNotice(`${result.status === "re-enrolled" ? "Re-enrolled" : "Registered"} ${result.user_id}. The uploaded image was discarded after inference.`);
-            setUserId("");
-            setImage(null);
-            await refresh();
-        }
-        catch (error) {
-            setNotice(error instanceof Error ? error.message : "Registration failed.");
-        }
-        finally {
-            setBusy(false);
-        }
-    }
-    async function deleteIdentity(identity) {
-        if (!window.confirm(`Delete ${identity.user_id} from the registered identity gallery?`))
-            return;
-        setDeletingId(identity.user_id);
-        setNotice("");
-        try {
-            const response = await fetch(`${API}/api/identities/${encodeURIComponent(identity.user_id)}`, { method: "DELETE" });
-            if (!response.ok) {
-                const result = await response.json().catch(() => ({}));
-                throw new Error(result.detail ?? "Could not delete identity.");
-            }
-            if (claimedId === identity.user_id)
-                setClaimedId("");
-            setNotice(`Deleted ${identity.user_id} from the gallery.`);
-            await refresh();
-        }
-        catch (error) {
-            setNotice(error instanceof Error ? error.message : "Could not delete identity.");
-        }
-        finally {
-            setDeletingId("");
-        }
-    }
-    async function recognize(event) {
-        event.preventDefault();
-        if (!recognitionImage) {
-            setRecognitionStatus("failure");
-            setRecognitionResult("Choose an iris image first.");
-            return;
-        }
-        if (recognitionMode === "verify" && !claimedId.trim()) {
-            setRecognitionStatus("failure");
-            setRecognitionResult("Enter the identity to verify.");
-            return;
-        }
-        setBusy(true);
-        setRecognitionStatus("");
-        setRecognitionResult("");
-        try {
-            const form = new FormData();
-            form.append("image", recognitionImage);
-            const extracted = await fetch(`${API}/api/recognition/embedding`, { method: "POST", body: form });
-            const output = await extracted.json();
-            if (!extracted.ok)
-                throw new Error(output.detail ?? "Embedding extraction failed");
-            const threshold = calibration?.data_source === "empirical" ? calibration.threshold : 0.75;
-            const endpoint = recognitionMode === "identify"
+            form.append("image", probeFile);
+
+            const extRes = await fetch(`${API}/api/recognition/embedding`, { method: "POST", body: form });
+            const extData = await extRes.json();
+            if (!extRes.ok) throw new Error(extData.detail ?? "Feature extraction failed");
+
+            const endpoint = verifyMode === "identify"
                 ? `${API}/api/identify?threshold=${threshold}`
                 : `${API}/api/verify/${encodeURIComponent(claimedId.trim())}?threshold=${threshold}`;
-            const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ embedding: output.embedding, model_fingerprint: output.model_fingerprint }) });
-            const result = await response.json();
-            if (!response.ok)
-                throw new Error(result.detail ?? "Recognition failed");
-            const succeeded = recognitionMode === "identify" ? result.matched : result.verified;
-            setRecognitionStatus(succeeded ? "success" : "failure");
-            setRecognitionResult(recognitionMode === "identify"
-                ? result.matched ? `Identified ${result.user_id} · similarity ${result.similarity.toFixed(4)} · threshold ${threshold.toFixed(4)}` : `No match above threshold · best similarity ${result.similarity.toFixed(4)} · threshold ${threshold.toFixed(4)}`
-                : result.verified ? `Verified ${result.user_id} · similarity ${result.similarity.toFixed(4)} · threshold ${threshold.toFixed(4)}` : `Verification denied · similarity ${result.similarity.toFixed(4)} · threshold ${threshold.toFixed(4)}`);
-        }
-        catch (error) {
-            setRecognitionStatus("failure");
-            setRecognitionResult(error instanceof Error ? error.message : "Recognition failed.");
-        }
-        finally {
+
+            const recRes = await fetch(endpoint, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    embedding: extData.embedding,
+                    model_fingerprint: extData.model_fingerprint,
+                }),
+            });
+            const recData = await recRes.json();
+            if (!recRes.ok) throw new Error(recData.detail ?? "Recognition failed");
+
+            const isSuccess = verifyMode === "identify" ? recData.matched : recData.verified;
+            const sim = recData.similarity;
+            const margin = sim - threshold;
+
+            setVerifyResult({
+                success: isSuccess,
+                title: isSuccess ? "ACCESS GRANTED" : "ACCESS DENIED",
+                subtitle: isSuccess
+                    ? `Matched Subject: ${recData.user_id}`
+                    : verifyMode === "identify"
+                        ? "No registered iris template matched above threshold"
+                        : `Verification failed for claimed ID: ${claimedId}`,
+                userId: recData.user_id ?? "None",
+                similarity: sim,
+                threshold: threshold,
+                margin: margin,
+            });
+        } catch (err) {
+            setNotice({ type: "error", message: err instanceof Error ? err.message : "Authentication failed." });
+        } finally {
             setBusy(false);
         }
-    }
-    const ref = dashboard?.dataset_reference;
-    const heldout = dashboard?.heldout_evaluation;
-    return <main className="shell">
-    <aside className="rail">
-      <div className="brand-mark">I<span>·</span></div>
-      <div className="rail-links"><a className="selected" title="Overview">◫</a><a href="#gallery" title="Gallery">◉</a><a href="#analytics" title="Analytics">⌁</a></div>
-      <div className="rail-bottom">IS</div>
-    </aside>
-    <section className="workspace">
-      <header className="topbar"><div className="crumb">IRISSECURE <span>/</span> BIOMETRIC INTELLIGENCE</div><div className="top-status"><i className={apiState === "online" ? "live" : ""}/>{apiState === "online" ? "API connected" : apiState === "offline" ? "API unavailable" : "Connecting"}<span className="avatar">BK</span></div></header>
-      <div className="content">
-        <div className="intro"><div><div className="eyebrow">SECURE ACCESS · R&D SYSTEM</div><h1>Good afternoon.</h1><p>Monitor your iris identity network and tune its verification boundary.</p></div><button className="quiet-button" onClick={() => void refresh()}>↻ <span>Refresh</span></button></div>
-        {apiState === "offline" && <div className="banner">Could not reach the API at <code>{API}</code>. Start the backend and reload this page.</div>}
-        {notice && <div className="banner notice">{notice}</div>}
+    };
 
-        <div className="metrics">
-          <article className="metric-card"><div className="metric-label">REGISTERED IDENTITIES <span className="metric-icon green">◉</span></div><div className="metric-value">{dashboard?.identity_count ?? "—"}</div><div className="metric-foot">Stored biometric templates</div></article>
-          <article className="metric-card"><div className="metric-label">REFERENCE CLASSES <span className="metric-icon blue">▦</span></div><div className="metric-value">{ref?.classes?.toLocaleString() ?? "—"}</div><div className="metric-foot">CASIA-Iris-Thousand benchmark</div></article>
-          <article className="metric-card"><div className="metric-label">EMBEDDING SIZE <span className="metric-icon violet">⌗</span></div><div className="metric-value">{ref?.embedding_dimension ?? 512}<small> dim</small></div><div className="metric-foot">L2-normalized feature vector</div></article>
-          <article className="metric-card"><div className="metric-label">ACTIVE MODEL <span className={`status-pill ${dashboard?.model_available ? "ready" : "pending"}`}>{dashboard?.model_available ? "READY" : "NOT TRAINED"}</span></div><div className={`model-state ${dashboard?.model_available ? "ready-text" : "pending-text"}`}>{dashboard?.model_available ? "Online" : "Setup required"}</div><div className="metric-foot">{dashboard?.stale_identity_count ? `${dashboard.stale_identity_count} saved identities need re-enrollment with the active model.` : dashboard?.candidate_model_active ? `Subject-disjoint model active · run ${dashboard.candidate_run_name}` : dashboard?.candidate_model_available ? `Subject-disjoint candidate ready · current model stays active` : dashboard?.model_available ? "Current demo model active · future training outputs stay separate" : "Add a trained checkpoint to enable capture"}</div></article>
+    const runEnrollment = async (e) => {
+        e.preventDefault();
+        if (!enrollFile || !enrollId.trim()) {
+            setNotice({ type: "error", message: "Provide an identity ID and an iris image." });
+            return;
+        }
+
+        setBusy(true);
+        setNotice(null);
+
+        try {
+            const form = new FormData();
+            form.append("image", enrollFile);
+
+            const extRes = await fetch(`${API}/api/recognition/embedding`, { method: "POST", body: form });
+            const extData = await extRes.json();
+            if (!extRes.ok) throw new Error(extData.detail ?? "Feature extraction failed");
+
+            const compositeId = `${enrollId.trim()}_${enrollEye}`;
+            const regRes = await fetch(
+                `${API}/api/identities/${encodeURIComponent(compositeId)}?eye=${enrollEye}&person_id=${encodeURIComponent(enrollId.trim())}`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        embedding: extData.embedding,
+                        model_fingerprint: extData.model_fingerprint,
+                    }),
+                }
+            );
+            const regData = await regRes.json();
+            if (!regRes.ok) throw new Error(regData.detail ?? "Enrollment failed");
+
+            setNotice({
+                type: "success",
+                message: `Successfully enrolled ${regData.user_id}. The source photo was discarded.`,
+            });
+            setEnrollId("");
+            clearEnrollFile();
+            await refresh();
+        } catch (err) {
+            setNotice({ type: "error", message: err instanceof Error ? err.message : "Enrollment failed." });
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const deleteSubject = async (identity) => {
+        if (!window.confirm(`Delete ${identity.user_id} from the biometric gallery?`)) return;
+        setDeletingId(identity.user_id);
+        setNotice(null);
+        try {
+            const res = await fetch(`${API}/api/identities/${encodeURIComponent(identity.user_id)}`, {
+                method: "DELETE",
+            });
+            if (!res.ok) throw new Error("Could not delete identity.");
+            if (claimedId === identity.user_id) setClaimedId("");
+            setNotice({ type: "info", message: `Deleted ${identity.user_id}.` });
+            await refresh();
+        } catch (err) {
+            setNotice({ type: "error", message: err instanceof Error ? err.message : "Deletion failed." });
+        } finally {
+            setDeletingId("");
+        }
+    };
+
+    const filteredIdentities = identities.filter((item) =>
+        item.user_id.toLowerCase().includes(searchQuery.toLowerCase())
+    );
+
+    return (
+        <div className="station-shell">
+            {/* Top Navigation Bar */}
+            <header className="top-navbar">
+                <div className="brand-group">
+                    <div className="brand-eye-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
+                            <circle cx="12" cy="12" r="3" />
+                        </svg>
+                    </div>
+                    <div className="brand-title-wrap">
+                        <span className="brand-name">IrisSecure</span>
+                        <span className="station-badge">STATION</span>
+                    </div>
+                </div>
+
+                <div className="top-actions">
+                    <div className={`backend-status-pill ${apiState === "online" ? "online" : "offline"}`}>
+                        <span className="status-dot" />
+                        <span>
+                            {apiState === "online"
+                                ? dashboard?.model_available
+                                    ? "Backend Online"
+                                    : "Model Offline"
+                                : "Disconnected"}
+                        </span>
+                    </div>
+
+                    <button
+                        className="refresh-circle-btn"
+                        onClick={() => void refresh()}
+                        title="Sync with backend"
+                        aria-label="Refresh"
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                            <path d="M3 3v5h5" />
+                            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+                            <path d="M16 16h5v5" />
+                        </svg>
+                    </button>
+                </div>
+            </header>
+
+            {/* Notification Toast */}
+            {notice && (
+                <div className={`toast-notice ${notice.type}`}>
+                    <span>{notice.message}</span>
+                    <button
+                        style={{ background: "none", border: "none", color: "inherit", cursor: "pointer", fontSize: 16 }}
+                        onClick={() => setNotice(null)}
+                    >
+                        ✕
+                    </button>
+                </div>
+            )}
+
+            {apiState === "offline" && (
+                <div className="toast-notice error">
+                    Backend offline at <code>{API}</code>. Ensure the FastAPI server is running.
+                </div>
+            )}
+
+            {/* Main Station Body: Left Sidebar + Right Workspace */}
+            <div className="station-body">
+                {/* Left Navigation Sidebar */}
+                <aside className="station-sidebar">
+                    <button
+                        className={`sidebar-tab-btn ${activeTab === "verify" ? "active" : ""}`}
+                        onClick={() => setActiveTab("verify")}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4" />
+                            <path d="M14 13.12c0 2.38 0 6.38-1 8.88" />
+                            <path d="M17.29 21.02c.12-.6.43-2.3.5-3.02" />
+                            <path d="M2 12a10 10 0 0 1 18-6" />
+                            <path d="M2 16h.01" />
+                            <path d="M21.8 16c.2-2 .131-5.354 0-6" />
+                            <path d="M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2" />
+                            <path d="M8.65 22c.21-.66.45-1.32.57-2" />
+                            <path d="M9 6.8a6 6 0 0 1 9 5.2v2" />
+                        </svg>
+                        <span>Authenticate</span>
+                    </button>
+
+                    <button
+                        className={`sidebar-tab-btn ${activeTab === "enroll" ? "active" : ""}`}
+                        onClick={() => setActiveTab("enroll")}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="12" cy="12" r="10" />
+                            <path d="M8 12h8" />
+                            <path d="M12 8v8" />
+                        </svg>
+                        <span>Enroll Identity</span>
+                    </button>
+
+                    <button
+                        className={`sidebar-tab-btn ${activeTab === "gallery" ? "active" : ""}`}
+                        onClick={() => setActiveTab("gallery")}
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <ellipse cx="12" cy="5" rx="9" ry="3" />
+                            <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+                            <path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3" />
+                        </svg>
+                        <span>Directory</span>
+                        <span className="sidebar-badge">{identities.length}</span>
+                    </button>
+                </aside>
+
+                {/* Right Workspace Content */}
+                <main className="station-main">
+                    {/* VIEW 1: AUTHENTICATE (BIOMETRIC SCANNER) */}
+                    {activeTab === "verify" && (
+                        <div>
+                            <div className="view-heading-wrap">
+                                <h1 className="view-title">Biometric Scanner</h1>
+                                <p className="view-subtitle">
+                                    Match an iris capture against the enrolled gallery or verify a specific subject claim.
+                                </p>
+                            </div>
+
+                            <div className="terminal-card">
+                                <form onSubmit={runVerification}>
+                                    <div className="scanner-grid">
+                                        {/* Left: Large Dropzone / Viewfinder */}
+                                        <div className="dropzone-container">
+                                            {!probePreview ? (
+                                                <div
+                                                    className="dropzone-box"
+                                                    onDragOver={(e) => e.preventDefault()}
+                                                    onDrop={(e) => {
+                                                        e.preventDefault();
+                                                        handleProbeSelect(e.dataTransfer.files?.[0]);
+                                                    }}
+                                                >
+                                                    <div className="dropzone-squircle-icon">
+                                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                                            <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
+                                                            <circle cx="12" cy="12" r="3" />
+                                                        </svg>
+                                                    </div>
+                                                    <div className="dropzone-main-text">Drop iris photo or click to browse</div>
+                                                    <div className="dropzone-sub-text">Supports JPEG, PNG, WEBP, BMP</div>
+                                                    <input
+                                                        type="file"
+                                                        accept="image/*"
+                                                        onChange={(e) => handleProbeSelect(e.target.files?.[0])}
+                                                    />
+                                                </div>
+                                            ) : (
+                                                <div className="preview-viewport">
+                                                    <img src={probePreview} alt="Probe" className="preview-image" />
+                                                    <div className="reticle-overlay">
+                                                        <div className="cyber-reticle">
+                                                            <div className="reticle-core" />
+                                                        </div>
+                                                        <div className="laser-scan-sweep" />
+                                                    </div>
+                                                    <button type="button" className="change-image-btn" onClick={clearProbe}>
+                                                        ✕ Change Image
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        {/* Right: Controls Column */}
+                                        <div className="controls-column">
+                                            <div>
+                                                <label className="field-label">Matching Mode</label>
+                                                <div className="segmented-mode-toggle">
+                                                    <button
+                                                        type="button"
+                                                        className={`mode-tab-btn ${verifyMode === "identify" ? "active" : ""}`}
+                                                        onClick={() => setVerifyMode("identify")}
+                                                    >
+                                                        1:N Identify
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className={`mode-tab-btn ${verifyMode === "verify" ? "active" : ""}`}
+                                                        onClick={() => setVerifyMode("verify")}
+                                                    >
+                                                        1:1 Verify
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            {verifyMode === "verify" && (
+                                                <div>
+                                                    <label className="field-label">Claimed Subject</label>
+                                                    <select
+                                                        className="select-box"
+                                                        value={claimedId}
+                                                        onChange={(e) => setClaimedId(e.target.value)}
+                                                    >
+                                                        <option value="">Select enrolled identity...</option>
+                                                        {identities.map((item) => (
+                                                            <option key={item.user_id} value={item.user_id}>
+                                                                {item.user_id}
+                                                            </option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                            )}
+
+                                            <div>
+                                                <label className="field-label">Security Sensitivity</label>
+                                                <div className="sensitivity-card">
+                                                    <div className="sensitivity-header">
+                                                        <span>Cosine Cutoff (τ)</span>
+                                                        <span className="sensitivity-value">{threshold.toFixed(2)}</span>
+                                                    </div>
+                                                    <input
+                                                        type="range"
+                                                        min="0.30"
+                                                        max="0.95"
+                                                        step="0.05"
+                                                        value={threshold}
+                                                        onChange={(e) => setThreshold(parseFloat(e.target.value))}
+                                                        className="range-slider"
+                                                    />
+                                                    <div className="sensitivity-marks">
+                                                        <span>Permissive (0.30)</span>
+                                                        <span>Standard (0.75)</span>
+                                                        <span>Strict (0.95)</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            <button
+                                                type="submit"
+                                                className="scan-cta-btn"
+                                                disabled={busy || !probeFile || !dashboard?.model_available}
+                                            >
+                                                {busy ? (
+                                                    <>
+                                                        <span className="spin-loader" /> Analyzing Iris Texture...
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                                            <path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4" />
+                                                            <path d="M14 13.12c0 2.38 0 6.38-1 8.88" />
+                                                            <path d="M17.29 21.02c.12-.6.43-2.3.5-3.02" />
+                                                            <path d="M2 12a10 10 0 0 1 18-6" />
+                                                            <path d="M2 16h.01" />
+                                                            <path d="M21.8 16c.2-2 .131-5.354 0-6" />
+                                                            <path d="M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2" />
+                                                            <path d="M8.65 22c.21-.66.45-1.32.57-2" />
+                                                            <path d="M9 6.8a6 6 0 0 1 9 5.2v2" />
+                                                        </svg>
+                                                        <span>Scan &amp; Authenticate</span>
+                                                    </>
+                                                )}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </form>
+
+                                {/* Result Output Card */}
+                                {verifyResult && (
+                                    <div className={`verification-result-panel ${verifyResult.success ? "granted" : "denied"}`}>
+                                        <div className="result-headline-row">
+                                            <div className="result-status-icon">{verifyResult.success ? "✓" : "✕"}</div>
+                                            <div>
+                                                <div className="result-status-title">{verifyResult.title}</div>
+                                                <div className="result-status-desc">{verifyResult.subtitle}</div>
+                                            </div>
+                                        </div>
+
+                                        <div className="result-metrics-grid">
+                                            <div className="metric-cell">
+                                                <span>SIMILARITY SCORE</span>
+                                                <b>{verifyResult.similarity.toFixed(4)}</b>
+                                            </div>
+                                            <div className="metric-cell">
+                                                <span>OPERATING THRESHOLD</span>
+                                                <b>{verifyResult.threshold.toFixed(4)}</b>
+                                            </div>
+                                            <div className="metric-cell">
+                                                <span>SCORE MARGIN</span>
+                                                <b style={{ color: verifyResult.margin >= 0 ? "var(--emerald)" : "var(--rose)" }}>
+                                                    {verifyResult.margin >= 0 ? "+" : ""}
+                                                    {verifyResult.margin.toFixed(4)}
+                                                </b>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* VIEW 2: ENROLL IDENTITY (Full-width two-column layout) */}
+                    {activeTab === "enroll" && (
+                        <div>
+                            <div className="view-heading-wrap">
+                                <h1 className="view-title">Enroll Identity</h1>
+                                <p className="view-subtitle">
+                                    Register a new biometric iris template into the secure gallery database.
+                                </p>
+                            </div>
+
+                            <div className="terminal-card">
+                                <form onSubmit={runEnrollment}>
+                                    <div className="scanner-grid">
+                                        {/* Left: Iris Template Image Dropzone / Preview */}
+                                        <div className="dropzone-container">
+                                            {!enrollPreview ? (
+                                                <div
+                                                    className="dropzone-box"
+                                                    onDragOver={(e) => e.preventDefault()}
+                                                    onDrop={(e) => {
+                                                        e.preventDefault();
+                                                        handleEnrollFileSelect(e.dataTransfer.files?.[0]);
+                                                    }}
+                                                >
+                                                    <div className="dropzone-squircle-icon">
+                                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                                                            <circle cx="12" cy="12" r="10" />
+                                                            <path d="M8 12h8" />
+                                                            <path d="M12 8v8" />
+                                                        </svg>
+                                                    </div>
+                                                    <div className="dropzone-main-text">Drop iris photo or click to browse</div>
+                                                    <div className="dropzone-sub-text">Supports JPEG, PNG, WEBP, BMP</div>
+                                                    <input
+                                                        type="file"
+                                                        accept="image/*"
+                                                        onChange={(e) => handleEnrollFileSelect(e.target.files?.[0])}
+                                                    />
+                                                </div>
+                                            ) : (
+                                                <div className="preview-viewport">
+                                                    <img src={enrollPreview} alt="Enrollment Probe" className="preview-image" />
+                                                    <button type="button" className="change-image-btn" onClick={clearEnrollFile}>
+                                                        ✕ Change Image
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        {/* Right: Controls Column */}
+                                        <div className="controls-column">
+                                            <div>
+                                                <label className="field-label">Subject Identifier</label>
+                                                <input
+                                                    type="text"
+                                                    className="text-box"
+                                                    placeholder="e.g. participant_042"
+                                                    value={enrollId}
+                                                    onChange={(e) => setEnrollId(e.target.value)}
+                                                />
+                                            </div>
+
+                                            <div>
+                                                <label className="field-label">Eye Designation</label>
+                                                <div className="segmented-mode-toggle">
+                                                    <button
+                                                        type="button"
+                                                        className={`mode-tab-btn ${enrollEye === "L" ? "active" : ""}`}
+                                                        onClick={() => setEnrollEye("L")}
+                                                    >
+                                                        👁 Left Eye (L)
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        className={`mode-tab-btn ${enrollEye === "R" ? "active" : ""}`}
+                                                        onClick={() => setEnrollEye("R")}
+                                                    >
+                                                        👁 Right Eye (R)
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            <div>
+                                                <button
+                                                    type="submit"
+                                                    className="scan-cta-btn"
+                                                    disabled={busy || !enrollFile || !enrollId.trim() || !dashboard?.model_available}
+                                                >
+                                                    {busy ? (
+                                                        <>
+                                                            <span className="spin-loader" /> Generating Neural Template...
+                                                        </>
+                                                    ) : (
+                                                        "＋  Register Biometric Template"
+                                                    )}
+                                                </button>
+
+                                                <p className="privacy-notice">
+                                                    🔒 Source photos are discarded immediately after 512-D normalized embedding extraction.
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* VIEW 3: DIRECTORY */}
+                    {activeTab === "gallery" && (
+                        <div>
+                            <div className="view-heading-wrap">
+                                <h1 className="view-title">Enrolled Directory</h1>
+                                <p className="view-subtitle">
+                                    Manage registered biometric templates stored in the active gallery.
+                                </p>
+                            </div>
+
+                            <div className="terminal-card">
+                                <div className="directory-filter-row">
+                                    <input
+                                        type="text"
+                                        className="text-box"
+                                        placeholder="Filter by subject ID..."
+                                        value={searchQuery}
+                                        onChange={(e) => setSearchQuery(e.target.value)}
+                                    />
+                                </div>
+
+                                {filteredIdentities.length > 0 ? (
+                                    <div className="directory-cards-grid">
+                                        {filteredIdentities.map((item) => (
+                                            <div key={item.user_id} className="subject-card">
+                                                <div className="subject-info">
+                                                    <div className="subject-avatar">
+                                                        {item.user_id.slice(0, 1).toUpperCase()}
+                                                    </div>
+                                                    <div>
+                                                        <div className="subject-id">{item.user_id}</div>
+                                                        <div className="subject-meta">
+                                                            <span className="eye-tag-pill">{item.eye || "EYE"}</span>
+                                                            <span>•</span>
+                                                            <span>{item.num_samples ?? 1} sample</span>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                <button
+                                                    type="button"
+                                                    className="delete-identity-btn"
+                                                    disabled={Boolean(deletingId)}
+                                                    onClick={() => deleteSubject(item)}
+                                                    title={`Delete ${item.user_id}`}
+                                                >
+                                                    {deletingId === item.user_id ? "..." : "Delete"}
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                ) : (
+                                    <div className="empty-gallery">
+                                        <div className="empty-gallery-icon">⦾</div>
+                                        <div style={{ fontWeight: 700, color: "var(--text-primary)", fontSize: 16 }}>No Identities Found</div>
+                                        <div style={{ fontSize: 13, marginTop: 4 }}>
+                                            {searchQuery
+                                                ? "No enrolled subjects match your search filter."
+                                                : "No biometric templates are currently enrolled. Switch to the Enroll tab to register one."}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </main>
+            </div>
         </div>
-
-        <div className="main-grid" id="analytics">
-          <article className="panel chart-panel"><div className="panel-head"><div><div className="eyebrow">STATISTICAL OPERATING POINT</div><h2>Verification error curve</h2><p>{calibration?.data_source === "empirical" ? `Measured on the ${calibration.split ?? "saved"} evaluation split` : "Estimate from aggregate reference score statistics"}</p></div><div className="optimizer-controls"><select aria-label="Threshold optimization objective" value={targetFar} onChange={e => setTargetFar(e.target.value)}><option value="eer">Balance FAR and FRR</option><option value="0.01">FAR ≤ 1%</option><option value="0.001">FAR ≤ 0.1%</option><option value="0.0001">FAR ≤ 0.01%</option></select><button className="primary-button" onClick={() => void optimize()} disabled={busy || apiState !== "online"}>{busy ? <><span className="spinner"/> Calibrating</> : "◎  Optimize threshold"}</button></div></div>
-            <div className="chart-wrap">{calibration ? <ReactECharts option={chartOption} notMerge style={{ height: 285, width: "100%" }}/> : <div className="chart-empty">Waiting for score summaries…</div>}</div>
-            <div className="chart-foot"><span><i className="legend-dot red"/>False accept rate</span><span><i className="legend-dot blue"/>False reject rate</span><span className="chart-note">{calibration?.data_source === "empirical" ? "Validation calibration scores" : "Aggregate-statistics estimate"}</span></div>
-          </article>
-          <article className="panel calibration-panel"><div className="eyebrow">SUGGESTED OPERATING POINT</div><h2>Threshold calibration</h2><p className="muted">{calibration?.objective === "minimize_frr_at_target_far" ? `Minimizes false rejects while satisfying the ${((calibration.target_far ?? 0) * 100).toPrecision(3)}% FAR target.` : "Selects the point where FAR and FRR are closest."}</p><div className="threshold">{calibration ? calibration.threshold.toFixed(3) : "—"}</div><div className="threshold-caption">COSINE SIMILARITY THRESHOLD</div><div className="rate-list"><div><span>{calibration?.data_source === "empirical" ? "Empirical FAR" : "Estimated FAR"}</span><b>{calibration ? `${(calibration.estimated_far * 100).toPrecision(3)}%` : "—"}</b></div><div><span>{calibration?.data_source === "empirical" ? "Empirical FRR" : "Estimated FRR"}</span><b>{calibration ? `${(calibration.estimated_frr * 100).toPrecision(3)}%` : "—"}</b></div><div><span>{calibration?.data_source === "empirical" ? "Empirical EER" : "Estimated EER"}</span><b>{calibration ? `${(calibration.estimated_eer * 100).toPrecision(3)}%` : "—"}</b></div></div><div className="assumption">ⓘ {calibration?.data_source === "empirical" ? `Computed from ${calibration.split ?? "evaluation"} score pairs. These metrics are split-specific.` : <>Gaussian estimate from reference aggregates. Run <code>evaluate.py</code> with the dataset to use empirical scores.</>}</div></article>
-        </div>
-
-        {heldout?.available && <article className="panel evidence-panel" id="evaluation">
-          <div className="panel-head compact"><div><div className="eyebrow">RESEARCH EVALUATION · HELD-OUT TEST</div><h2>Does threshold tuning improve on the fixed baseline?</h2><p>Threshold selected on validation scores, then frozen for test measurements.</p></div><span className="count-tag">{heldout.num_genuine_pairs?.toLocaleString()} genuine · {heldout.num_impostor_pairs?.toLocaleString()} impostor pairs</span></div>
-          <div className="evidence-metrics">
-            <div><span>TEST ROC-AUC</span><b>{heldout.test_roc_auc?.toFixed(6) ?? "—"}</b></div>
-            <div><span>VALIDATION-SELECTED THRESHOLD</span><b>{heldout.test_at_validation_eer?.threshold?.toFixed(4) ?? "—"}</b></div>
-            <div><span>FROZEN-THRESHOLD TEST TAR</span><b>{heldout.test_at_validation_eer ? `${(heldout.test_at_validation_eer.tar * 100).toFixed(2)}%` : "—"}</b></div>
-            <div><span>FIXED 0.75 TEST TAR</span><b>{heldout.test_at_fixed_threshold ? `${(heldout.test_at_fixed_threshold.tar * 100).toFixed(2)}%` : "—"}</b></div>
-          </div>
-          <div className="table-wrap evidence-table-wrap"><table><thead><tr><th>OPERATING POINT</th><th>THRESHOLD</th><th>TEST FAR</th><th>TEST FRR</th><th>TEST TAR</th><th>BALANCED ACCURACY</th></tr></thead><tbody>
-            {[
-              ['Validation-selected EER', heldout.test_at_validation_eer],
-              ['Fixed baseline (0.75)', heldout.test_at_fixed_threshold],
-              ...Object.entries(heldout.target_far_operations ?? {}).map(([target, operation]) => [`Validation target FAR ${(Number(target) * 100).toPrecision(3)}%`, operation.test_metrics_at_threshold]),
-            ].map(([label, metric]) => <tr key={label}><td>{label}</td><td>{metric?.threshold?.toFixed(4) ?? "—"}</td><td>{metric ? `${(metric.far * 100).toFixed(3)}%` : "—"}</td><td>{metric ? `${(metric.frr * 100).toFixed(3)}%` : "—"}</td><td>{metric ? `${(metric.tar * 100).toFixed(2)}%` : "—"}</td><td>{metric ? `${(metric.balanced_accuracy * 100).toFixed(2)}%` : "—"}</td></tr>)}
-          </tbody></table></div>
-          <div className="assumption">The observed FAR was 0 among {heldout.num_impostor_pairs?.toLocaleString()} sampled test comparisons; this does not establish a population FAR of zero. The subject-cluster bootstrap interval for test FRR at the validation-selected threshold is {(() => { const ci = heldout.subject_cluster_bootstrap?.intervals?.validation_eer?.frr; return ci ? `${(ci[0] * 100).toFixed(2)}%–${(ci[1] * 100).toFixed(2)}%` : "not available"; })()}. Training, validation, and test identities are subject-disjoint.</div>
-        </article>}
-
-        <div className="lower-grid" id="gallery">
-          <article className="panel gallery-panel"><div className="panel-head compact"><div><div className="eyebrow">IDENTITY NETWORK</div><h2>Recent registrations</h2></div><span className="count-tag">{identities.length} shown</span></div><div className="table-wrap"><table><thead><tr><th>IDENTITY</th><th>EYE</th><th>SAMPLES</th><th>REGISTERED</th><th>ACTION</th></tr></thead><tbody>{identities.length ? identities.slice(0, 7).map(row => <tr key={row.user_id}><td><span className="identity-icon">{row.user_id.slice(0, 1).toUpperCase()}</span>{row.user_id}</td><td><span className="eye-tag">{row.eye || "—"}</span></td><td>{row.num_samples}</td><td>{new Date(row.created_at).toLocaleDateString()}</td><td><button className="delete-button" type="button" disabled={Boolean(deletingId)} onClick={() => deleteIdentity(row)} aria-label={`Delete ${row.user_id}`} title={`Delete ${row.user_id}`}>{deletingId === row.user_id ? "Deleting…" : "Delete"}</button></td></tr>) : <tr><td colSpan={5} className="empty-cell">No identities registered yet.</td></tr>}</tbody></table></div></article>
-          <article className="panel register-panel"><div className="eyebrow">ENROLLMENT</div><h2>Register an identity</h2><p className="muted">Images are discarded after inference; a model-tagged embedding is stored.</p><form onSubmit={register}><label>Identity ID<input value={userId} onChange={e => setUserId(e.target.value)} placeholder="e.g. participant-042"/></label><div className="form-row"><label>Eye<select value={eye} onChange={e => setEye(e.target.value)}><option value="L">Left eye</option><option value="R">Right eye</option></select></label><label className="file-label">Iris image<input type="file" accept="image/*" onChange={e => setImage(e.target.files?.[0] ?? null)}/></label></div><button className="primary-button full" disabled={busy || !dashboard?.model_available}>{busy ? "Working…" : "＋  Enroll identity"}</button>{!dashboard?.model_available && <div className="small-help">Training a model checkpoint is required before enrollment.</div>}</form></article>
-        </div>
-        <article className="panel recognition-panel"><div><div className="eyebrow">LIVE INFERENCE</div><h2>Identify or verify an iris</h2><p className="muted">The uploaded image is discarded after inference; it is not stored in the gallery.</p></div><form onSubmit={recognize} className="recognition-form"><label>Mode<select value={recognitionMode} onChange={e => setRecognitionMode(e.target.value)}><option value="identify">Identify · search gallery</option><option value="verify">Verify · 1:1 claim</option></select></label>{recognitionMode === "verify" && <label>Claimed identity<select value={claimedId} onChange={e => setClaimedId(e.target.value)}><option value="">Choose identity</option>{identities.map(identity => <option key={identity.user_id} value={identity.user_id}>{identity.user_id}</option>)}</select></label>}<label className="recognition-file">Iris image<input type="file" accept="image/*" onChange={e => setRecognitionImage(e.target.files?.[0] ?? null)}/></label><button className="primary-button" disabled={busy || !dashboard?.model_available}>{busy ? "Processing…" : "◉  Run recognition"}</button></form>{recognitionResult && <div className={`recognition-result ${recognitionStatus}`}>{recognitionResult}</div>}</article>
-        <footer><span>IRISSECURE <b>2.0</b> · BIOMETRIC R&amp;D PLATFORM</span><span>FastAPI · Next.js · SQLite · ECharts</span></footer>
-      </div>
-    </section>
-  </main>;
+    );
 }
